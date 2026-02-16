@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "id": "blockscope",
+  "version": "${version}",
+  "name": "Blockscope",
+  "description": "AI training data collection mod that records gameplay video enriched with inputs, blocks and game state",
+  "authors": [
+    "humboldt123"
+  ],
+  "contact": {
+    "homepage": "https://github.com/humboldt123/blockscope",
+    "sources": "https://github.com/humboldt123/blockscope"
+  },
+  "license": "MIT",
+  "icon": "assets/blockscope/icon.png",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "com.blockscope.BlockscopeClient"
+    ]
+  },
+  "mixins": [
+    "blockscope.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.14.0",
+    "fabric": "*",
+    "minecraft": "1.16.5"
+  }
+}

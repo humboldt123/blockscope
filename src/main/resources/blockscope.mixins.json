@@ -1,0 +1,17 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "com.blockscope.mixin",
+  "compatibilityLevel": "JAVA_8",
+  "client": [
+    "GameRendererMixin",
+    "KeyboardMixin",
+    "MouseMixin",
+    "ChunkBuilderMixin",
+    "ChunkRendererRegionAccessor",
+    "WorldChunkMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

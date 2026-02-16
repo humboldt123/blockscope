@@ -1,0 +1,48 @@
+#Blockscope
+visualizer
+dummy
+.claude
+hi
+TODO.md
+ROADMAP.md
+TECHNICAL.md
+gradle.zip
+gradle-7.5.1/
+
+# Gradle
+.gradle/
+build/
+out/
+classes/
+
+# Eclipse
+*.launch
+.settings/
+.metadata
+.classpath
+.project
+
+# IntelliJ
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# VS Code
+.vscode/
+
+# Fabric
+run/
+logs/
+
+# Recordings
+recordings/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+*.log
+*.swp
+*~
