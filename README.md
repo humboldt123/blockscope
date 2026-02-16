@@ -4,8 +4,8 @@
 
 Blockscope is a Fabric mod that records rich, synchronized gameplay data for training AI models. It captures H.264 video, keyboard/mouse inputs, and comprehensive game state data with precise tick-level synchronization.
 
-Also see [Blockscope Visualizer](https://github.com/humboldt123/blockscope-visualizer)
----
+Also See: [Blockscope Visualizer](https://github.com/humboldt123/blockscope-visualizer)
+
 
 
 ## Dev Stuff
