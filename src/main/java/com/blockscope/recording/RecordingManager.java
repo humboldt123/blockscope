@@ -1,8 +1,11 @@
 package com.blockscope.recording;
 
 import com.blockscope.model.*;
+import com.blockscope.upload.UploaderThread;
+import com.blockscope.upload.ChunkedVideoUploader;
 import com.blockscope.util.Config;
 import com.blockscope.util.KeybindingsExporter;
+import com.blockscope.util.PlayerAnonymizer;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.Screen;
 import net.minecraft.client.gui.screen.ingame.HandledScreen;
@@ -22,12 +25,12 @@ import net.minecraft.state.property.Property;
 import net.minecraft.screen.ScreenHandler;
 import net.minecraft.screen.slot.Slot;
 import net.minecraft.screen.slot.SlotActionType;
+import net.minecraft.registry.Registries;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.hit.EntityHitResult;
 import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
-import net.minecraft.util.registry.Registry;
 import net.minecraft.world.World;
 
 import java.nio.file.Path;
@@ -42,6 +45,11 @@ public class RecordingManager {
     private final Config config;
     private final AsyncWriter writer;
     private VideoEncoder videoEncoder;
+    private SegmentedTSEncoder segmentedEncoder;
+    private StreamingDataWriter ticksWriter;
+    private StreamingDataWriter inputsWriter;
+    private StreamingDataWriter blockChangesWriter;
+    private StreamingDataWriter frameMappingWriter;
 
     private final AtomicBoolean isRecording = new AtomicBoolean(false);
     private final AtomicLong currentTick = new AtomicLong(0);
@@ -56,25 +64,30 @@ public class RecordingManager {
     private Path frameMappingFile; // Maps video frame index -> tick number
     private SessionMetadata metadata;
 
-    // Inventory change detection
-    private TickData.InventoryState previousInventory;
 
-    // Phase 4: Entity/block change detection (delta encoding)
-    private TickData.NearbyEntitiesState previousNearbyEntities;
-    private TickData.NearbyBlocksState previousNearbyBlocks;
+    // ReplayMod approach: Save raw chunk NBT + camera state in ticks.jsonl
+    // Visualizer computes visible blocks from chunks + camera frustum
 
-    // Phase 4.1: Master map tracking (event-based architecture)
-    // Master map: "dimension:x:y:z" -> block data (accumulates all seen blocks)
-    private java.util.HashMap<String, WorldEvent.BlockData> masterBlockMap = new java.util.HashMap<>();
-    // Entity map: UUID -> entity data (tracks all seen entities)
-    private java.util.HashMap<String, WorldEvent.EntityData> masterEntityMap = new java.util.HashMap<>();
-    // Last snapshot tick (for periodic full dumps every 1200 ticks)
-    private long lastSnapshotTick = 0;
+    // Chunk upload infrastructure
+    private final java.util.concurrent.ConcurrentHashMap<String, Boolean> savedChunks = new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.concurrent.BlockingQueue<ChunkUploadTask> chunkUploadQueue = new java.util.concurrent.LinkedBlockingQueue<>(100);
+    private Thread chunkUploaderThread;
 
-    // Batching for block_seen events (to prevent queue overflow)
-    private final java.util.concurrent.ConcurrentHashMap<String, WorldEvent.BlockData> blockBatchBuffer = new java.util.concurrent.ConcurrentHashMap<>();
-    private final Object batchLock = new Object();
-    private static final int BATCH_SIZE = 500; // Flush after 500 blocks
+    private static class ChunkUploadTask {
+        final String dimension;
+        final int chunkX;
+        final int chunkZ;
+        final long tick;
+        final byte[] nbtData;
+
+        ChunkUploadTask(String dimension, int chunkX, int chunkZ, long tick, byte[] nbtData) {
+            this.dimension = dimension;
+            this.chunkX = chunkX;
+            this.chunkZ = chunkZ;
+            this.tick = tick;
+            this.nbtData = nbtData;
+        }
+    }
 
     private RecordingManager() {
         this.config = Config.getInstance();
@@ -93,6 +106,9 @@ public class RecordingManager {
             return;
         }
 
+        // Reset player anonymizer for new session
+        PlayerAnonymizer.getInstance().resetSession();
+
         sessionId = "session_" + Instant.now().getEpochSecond();
         sessionDir = Paths.get(config.recordingDirectory, sessionId);
         ticksFile = sessionDir.resolve("ticks.jsonl");
@@ -103,31 +119,57 @@ public class RecordingManager {
 
         currentTick.set(0);
         tickStartTime = System.currentTimeMillis();
-        previousInventory = null; // Reset inventory tracking
-        previousNearbyEntities = null; // Reset entity tracking (Phase 4)
-        previousNearbyBlocks = null; // Reset block tracking (Phase 4)
 
-        // Phase 4.1: Clear master maps for new session
-        masterBlockMap.clear();
-        masterEntityMap.clear();
-        lastSnapshotTick = 0;
-        blockBatchBuffer.clear();
+        // ReplayMod approach: no master maps, just raw chunk data + camera
 
-        // Initialize video encoder
-        videoEncoder = new VideoEncoder(config);
+        // Initialize session on server FIRST
         try {
-            videoEncoder.startRecording(videoFile.toFile());
-        } catch (java.io.IOException e) {
-            System.err.println("[Blockscope] Failed to start video encoder: " + e.getMessage());
+            java.net.URL initUrl = new java.net.URL(config.serverUrl + "/init-session?session_id=" + sessionId);
+            java.net.HttpURLConnection conn = (java.net.HttpURLConnection) initUrl.openConnection();
+            conn.setRequestMethod("POST");
+            int responseCode = conn.getResponseCode();
+            if (responseCode == 200) {
+                System.out.println("[Blockscope] Initialized session on server");
+            } else {
+                System.err.println("[Blockscope] Failed to initialize session: HTTP " + responseCode);
+            }
+            conn.disconnect();
+        } catch (Exception e) {
+            System.err.println("[Blockscope] Error initializing session: " + e.getMessage());
+        }
+
+        // Initialize streaming data writers for ticks, inputs, and block_changes
+        ticksWriter = new StreamingDataWriter(sessionId, config.serverUrl, "ticks");
+        inputsWriter = new StreamingDataWriter(sessionId, config.serverUrl, "inputs");
+        blockChangesWriter = new StreamingDataWriter(sessionId, config.serverUrl, "block_changes");
+        frameMappingWriter = new StreamingDataWriter(sessionId, config.serverUrl, "frame_mapping");
+        System.out.println("[Blockscope] Streaming data writers initialized");
+
+        // Initialize segmented TS encoder
+        try {
+            System.out.println("[Blockscope] Initializing segmented video recording...");
+            segmentedEncoder = new SegmentedTSEncoder(config, sessionId, config.serverUrl, sessionDir);
+            segmentedEncoder.startRecording();
+            System.out.println("[Blockscope] Segmented TS encoder started successfully");
+        } catch (Exception e) {
+            System.err.println("[Blockscope] CRITICAL: Failed to start video recording!");
+            System.err.println("[Blockscope] Error type: " + e.getClass().getName());
+            System.err.println("[Blockscope] Error message: " + e.getMessage());
             e.printStackTrace();
-            videoEncoder = null;
+            segmentedEncoder = null;
+
+            // Alert user in chat
+            if (config.showChatMessages) {
+                MinecraftClient.getInstance().inGameHud.getChatHud().addMessage(
+                    net.minecraft.text.Text.literal("§c[Blockscope] Video recording failed to start! Check logs."));
+            }
         }
 
         // Initialize metadata
         metadata = new SessionMetadata();
         metadata.sessionId = sessionId;
         metadata.startTimestamp = Instant.now().getEpochSecond();
-        metadata.minecraftVersion = "1.16.5";
+        metadata.minecraftVersion = "1.19.4";
         metadata.modVersion = "0.1.0-alpha";
 
         SessionMetadata.RecordingConfig recordingConfig = new SessionMetadata.RecordingConfig();
@@ -138,24 +180,61 @@ public class RecordingManager {
         recordingConfig.recordingDirectory = config.recordingDirectory;
         metadata.config = recordingConfig;
 
+        // Ensure session directory exists FIRST
+        try {
+            java.nio.file.Files.createDirectories(sessionDir);
+            System.out.println("[Blockscope] Created session directory: " + sessionDir);
+        } catch (Exception e) {
+            System.err.println("[Blockscope] Failed to create session directory: " + e.getMessage());
+        }
+
+        // Upload metadata to server (NO local writes)
+        try {
+            uploadMetadataToServer();
+            System.out.println("[Blockscope] Uploaded metadata to server");
+        } catch (Exception e) {
+            System.err.println("[Blockscope] CRITICAL: Failed to upload metadata!");
+            System.err.println("[Blockscope] Error: " + e.getMessage());
+            e.printStackTrace();
+        }
+
         writer.start();
+
+        // Start chunk uploader thread
+        savedChunks.clear();
+        chunkUploadQueue.clear();
+        chunkUploaderThread = new Thread(this::chunkUploaderLoop, "Blockscope-ChunkUploader");
+        chunkUploaderThread.setDaemon(true);
+        chunkUploaderThread.start();
+
         isRecording.set(true);
 
-        // Trigger chunk rebuilds to capture all currently visible blocks
-        // This ensures blocks rendered before pressing R are captured
-        triggerChunkRebuilds();
+        // Capture all already-loaded chunks (chunks near player that loaded before recording started)
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client.player != null && client.world != null) {
+            net.minecraft.client.world.ClientChunkManager chunkManager = client.world.getChunkManager();
+            int renderDistance = client.options.getViewDistance().getValue();
+            net.minecraft.util.math.BlockPos playerPos = client.player.getBlockPos();
+            int playerChunkX = playerPos.getX() >> 4;
+            int playerChunkZ = playerPos.getZ() >> 4;
 
-        // Write initial metadata
-        writer.writeBytes(sessionDir.resolve("metadata.json"),
-            metadata.toJson().getBytes(), true);
+            System.out.println("[Blockscope] Capturing already-loaded chunks in radius " + renderDistance);
+            for (int cx = playerChunkX - renderDistance; cx <= playerChunkX + renderDistance; cx++) {
+                for (int cz = playerChunkZ - renderDistance; cz <= playerChunkZ + renderDistance; cz++) {
+                    net.minecraft.world.chunk.WorldChunk chunk = chunkManager.getWorldChunk(cx, cz);
+                    if (chunk != null) {
+                        onChunkLoad(chunk, null);
+                    }
+                }
+            }
+            System.out.println("[Blockscope] Finished capturing already-loaded chunks");
+        }
 
-        // Write keybindings (to understand non-default controls)
-        writer.writeBytes(sessionDir.resolve("keybindings.json"),
-            KeybindingsExporter.exportKeybindings().getBytes(), true);
+        // Blocks will be captured as player explores (block changes tracked via WorldChunkMixin)
 
         if (config.showChatMessages) {
             MinecraftClient.getInstance().inGameHud.getChatHud().addMessage(
-                new net.minecraft.text.LiteralText("[Blockscope] Recording started: " + sessionId));
+                net.minecraft.text.Text.literal("[Blockscope] Recording started: " + sessionId));
         }
 
         System.out.println("[Blockscope] Recording started: " + sessionId);
@@ -166,30 +245,65 @@ public class RecordingManager {
             return;
         }
 
-        // Flush any remaining batched blocks
-        flushBlockBatch();
-
         isRecording.set(false);
 
-        // Stop video encoder and finalize video file
-        if (videoEncoder != null) {
-            videoEncoder.stopRecording();
-            videoEncoder = null;
+        // Stop streaming data writers
+        if (ticksWriter != null) {
+            ticksWriter.stop();
+            ticksWriter = null;
+        }
+        if (inputsWriter != null) {
+            inputsWriter.stop();
+            inputsWriter = null;
+        }
+        if (blockChangesWriter != null) {
+            blockChangesWriter.stop();
+            blockChangesWriter = null;
+        }
+        if (frameMappingWriter != null) {
+            frameMappingWriter.stop();
+            frameMappingWriter = null;
         }
 
-        // Write final metadata
+        // Wait for chunk uploads to complete
+        if (chunkUploaderThread != null) {
+            try {
+                chunkUploaderThread.join(30000); // 30 second timeout
+                System.out.println("[Blockscope] Chunk uploader finished");
+            } catch (InterruptedException e) {
+                System.err.println("[Blockscope] Chunk uploader interrupted");
+            }
+        }
+
+        // Stop segmented encoder (will upload remaining segments)
+        if (segmentedEncoder != null) {
+            segmentedEncoder.stopRecording();
+            segmentedEncoder = null;
+        }
+
+        // Write final metadata locally (update with end timestamp)
         metadata.endTimestamp = Instant.now().getEpochSecond();
-        writer.writeBytes(sessionDir.resolve("metadata.json"),
-            metadata.toJson().getBytes(), true);
+        try {
+            // Upload final metadata to server (NO local writes)
+            uploadMetadataToServer();
+        } catch (Exception e) {
+            System.err.println("[Blockscope] Failed to upload final metadata: " + e.getMessage());
+        }
 
         writer.stop();
 
         if (config.showChatMessages) {
             MinecraftClient.getInstance().inGameHud.getChatHud().addMessage(
-                new net.minecraft.text.LiteralText("[Blockscope] Recording stopped: " + sessionId));
+                net.minecraft.text.Text.literal("[Blockscope] Recording stopped: " + sessionId));
         }
 
         System.out.println("[Blockscope] Recording stopped: " + sessionId);
+
+        // Tell server to finalize video (concat segments to MP4)
+        // Note: Server will auto-finalize after 15s of no segments anyway
+        finalizeVideo();
+
+        // All data (ticks, inputs, video) already streamed - no upload needed!
     }
 
     public void onClientTick() {
@@ -214,35 +328,45 @@ public class RecordingManager {
         tickData.player = capturePlayerState(client.player);
         tickData.world = captureWorldState(client.world);
 
-        // Only capture inventory if it changed (optimization for disk space and performance)
-        TickData.InventoryState currentInventory = captureInventoryState(client.player);
-        if (previousInventory == null || !inventoryEquals(previousInventory, currentInventory)) {
-            tickData.inventory = currentInventory;
-            previousInventory = currentInventory;
-        }
-        // If inventory unchanged, tickData.inventory will be null (JSON will omit the field)
+        // Capture inventory every tick (better for ML - self-contained samples)
+        tickData.inventory = captureInventoryState(client.player);
 
         tickData.gui = captureGuiState(client.currentScreen);
         tickData.crosshairTarget = captureCrosshairTarget(client);
         tickData.gamemode = client.interactionManager.getCurrentGameMode().getName();
 
-        // Phase 4.1: Event-based world tracking (blocks/entities captured via mixins and events)
-
-        // Flush block batch every 20 ticks (1 second) to ensure timely writes
-        if (tick % 20 == 0 && !blockBatchBuffer.isEmpty()) {
-            flushBlockBatch();
-        }
-
-        // Periodic snapshot every 1200 ticks (~1 minute) to prevent unbounded diff chains
-        if (tick - lastSnapshotTick >= 1200) {
-            writePeriodicSnapshot(client.player, client.world, tick);
-            lastSnapshotTick = tick;
-        }
+        // Camera state ALREADY in tickData (x,y,z,pitch,yaw,fov,cameraPerspective)
+        // Chunks saved as binary NBT files via onChunkLoad
+        // Block changes saved to block_changes.jsonl via onBlockChanged
 
         // Note: Phase 4 old code (captureNearbyEntitiesState/captureNearbyBlocksState) is deprecated
         // Now using event-based master map + diffs (see ChunkBuilderMixin, WorldChunkMixin)
 
-        writer.writeJsonLine(ticksFile, tickData.toJson());
+        // Stream tick data to server instead of writing locally
+        if (ticksWriter != null) {
+            ticksWriter.writeLine(tickData.toJson());
+        }
+    }
+
+    // Cached reflection fields to avoid repeated lookups
+    private static java.lang.reflect.Field focusedSlotField = null;
+    private static java.lang.reflect.Field burnTimeField = null;
+    private static java.lang.reflect.Field cookTimeField = null;
+    static {
+        try {
+            focusedSlotField = HandledScreen.class.getDeclaredField("focusedSlot");
+            focusedSlotField.setAccessible(true);
+        } catch (Exception e) {
+            System.err.println("[Blockscope] Failed to cache focusedSlot field: " + e.getMessage());
+        }
+        try {
+            burnTimeField = AbstractFurnaceBlockEntity.class.getDeclaredField("burnTime");
+            burnTimeField.setAccessible(true);
+            cookTimeField = AbstractFurnaceBlockEntity.class.getDeclaredField("cookTime");
+            cookTimeField.setAccessible(true);
+        } catch (Exception e) {
+            System.err.println("[Blockscope] Failed to cache furnace fields: " + e.getMessage());
+        }
     }
 
     public void onRenderTick() {
@@ -258,15 +382,17 @@ public class RecordingManager {
             return;
         }
 
-        // Capture and encode frame directly to video
-        if (videoEncoder != null) {
-            boolean captured = videoEncoder.captureAndEncodeFrame();
+        // Capture and encode frame via segmented TS encoder
+        if (segmentedEncoder != null) {
+            boolean captured = segmentedEncoder.captureAndEncodeFrame();
             if (captured) {
-                // Record which tick this frame corresponds to
-                int frameIndex = videoEncoder.getFrameCount() - 1;
+                // Record which tick this frame corresponds to (stream to server)
+                int frameIndex = segmentedEncoder.getFrameCount() - 1;
                 long tick = currentTick.get();
-                writer.writeJsonLine(frameMappingFile,
-                    "{\"frame\":" + frameIndex + ",\"tick\":" + tick + "}");
+                if (frameMappingWriter != null) {
+                    String frameMappingLine = "{\"frame\":" + frameIndex + ",\"tick\":" + tick + "}";
+                    frameMappingWriter.writeLine(frameMappingLine);
+                }
             }
         }
     }
@@ -279,7 +405,10 @@ public class RecordingManager {
         event.tick = currentTick.get();
         event.offsetMs = System.currentTimeMillis() - tickStartTime;
 
-        writer.writeJsonLine(inputsFile, event.toJson());
+        // Stream input event to server instead of writing locally
+        if (inputsWriter != null) {
+            inputsWriter.writeLine(event.toJson());
+        }
     }
 
     public boolean isRecording() {
@@ -306,15 +435,15 @@ public class RecordingManager {
         state.yaw = player.getYaw(1.0f);
 
         // Visual settings (can change during gameplay)
-        state.fov = (float) client.options.fov;
-        state.mouseSensitivity = client.options.mouseSensitivity;
+        state.fov = (float) client.options.getFov().getValue();
+        state.mouseSensitivity = client.options.getMouseSensitivity().getValue();
 
         // Player state
         state.health = player.getHealth();
         state.hunger = player.getHungerManager().getFoodLevel();
         state.saturation = player.getHungerManager().getSaturationLevel();
         state.armor = player.getArmor();
-        state.hotbarIndex = player.inventory.selectedSlot;
+        state.hotbarIndex = player.getInventory().selectedSlot;
 
         ItemStack heldStack = player.getMainHandStack();
         if (!heldStack.isEmpty()) {
@@ -345,7 +474,7 @@ public class RecordingManager {
                                     client.currentScreen.getFocused() != null);
         }
 
-        state.hideGui = client.options.hudHidden; // F2 pressed
+        state.hideGui = client.options.hudHidden; // F1 pressed
         state.debugScreenVisible = client.options.debugEnabled; // F3 pressed
 
         // Camera settings (F5 perspective)
@@ -363,11 +492,44 @@ public class RecordingManager {
                 state.cameraPerspective = "first_person";
         }
 
+        // Active status effects (potions)
+        state.statusEffects = captureStatusEffects(player);
+
         // Accessibility/gameplay settings
-        state.showSubtitles = client.options.showSubtitles;
-        state.autoJumpEnabled = client.options.autoJump;
+        state.showSubtitles = client.options.getShowSubtitles().getValue();
+        state.autoJumpEnabled = client.options.getAutoJump().getValue();
 
         return state;
+    }
+
+    private TickData.StatusEffect[] captureStatusEffects(ClientPlayerEntity player) {
+        java.util.Collection<net.minecraft.entity.effect.StatusEffectInstance> effects =
+            player.getStatusEffects();
+
+        if (effects.isEmpty()) {
+            return null; // Omit field if no effects
+        }
+
+        java.util.List<TickData.StatusEffect> effectList = new java.util.ArrayList<>();
+
+        for (net.minecraft.entity.effect.StatusEffectInstance effect : effects) {
+            TickData.StatusEffect statusEffect = new TickData.StatusEffect();
+
+            // Get effect ID (e.g. "minecraft:speed")
+            Identifier effectId = Registries.STATUS_EFFECT.getId(effect.getEffectType());
+            statusEffect.effectId = effectId != null ? effectId.toString() : "unknown";
+
+            // Effect properties
+            statusEffect.amplifier = effect.getAmplifier(); // 0 = level I, 1 = level II, etc.
+            statusEffect.duration = effect.getDuration(); // Remaining ticks
+            statusEffect.ambient = effect.isAmbient(); // From beacon (fewer particles)
+            statusEffect.showParticles = effect.shouldShowParticles();
+            statusEffect.showIcon = effect.shouldShowIcon();
+
+            effectList.add(statusEffect);
+        }
+
+        return effectList.toArray(new TickData.StatusEffect[0]);
     }
 
     private TickData.WorldState captureWorldState(World world) {
@@ -381,7 +543,7 @@ public class RecordingManager {
         ClientPlayerEntity player = MinecraftClient.getInstance().player;
         if (player != null) {
             BlockPos pos = player.getBlockPos();
-            Identifier biomeId = world.getRegistryManager().get(Registry.BIOME_KEY).getId(world.getBiome(pos));
+            Identifier biomeId = world.getBiome(pos).getKey().map(key -> key.getValue()).orElse(null);
             state.biome = biomeId != null ? biomeId.toString() : "unknown";
         }
 
@@ -396,29 +558,55 @@ public class RecordingManager {
 
     private TickData.InventoryState captureInventoryState(ClientPlayerEntity player) {
         TickData.InventoryState state = new TickData.InventoryState();
+        java.util.List<TickData.SlotItem> slotsList = new java.util.ArrayList<>();
 
-        // Main inventory (36 slots)
-        state.mainInventory = new TickData.ItemStack[36];
+        // Minecraft slot layout:
+        // Slots 0-8: Hotbar
+        // Slots 9-35: Main inventory (27 slots)
+        // Slots 36-39: Armor (boots, leggings, chestplate, helmet)
+        // Slot 40: Offhand
+
+        // Capture main inventory + hotbar (slots 0-35)
         for (int i = 0; i < 36; i++) {
-            ItemStack stack = player.inventory.getStack(i);
+            ItemStack stack = player.getInventory().getStack(i);
             if (!stack.isEmpty()) {
-                state.mainInventory[i] = createItemStack(stack);
+                TickData.SlotItem slotItem = new TickData.SlotItem();
+                slotItem.slot = i;
+                slotItem.item = createItemStack(stack);
+                slotsList.add(slotItem);
             }
         }
 
-        // Armor (4 slots)
-        state.armor = new TickData.ItemStack[4];
+        // Capture armor (slots 36-39)
         for (int i = 0; i < 4; i++) {
-            ItemStack stack = player.inventory.armor.get(i);
+            ItemStack stack = player.getInventory().armor.get(i);
             if (!stack.isEmpty()) {
-                state.armor[i] = createItemStack(stack);
+                TickData.SlotItem slotItem = new TickData.SlotItem();
+                slotItem.slot = 36 + i;
+                slotItem.item = createItemStack(stack);
+                slotsList.add(slotItem);
             }
         }
 
-        // Offhand
+        // Capture offhand (slot 40)
         ItemStack offhandStack = player.getOffHandStack();
         if (!offhandStack.isEmpty()) {
-            state.offhand = createItemStack(offhandStack);
+            TickData.SlotItem slotItem = new TickData.SlotItem();
+            slotItem.slot = 40;
+            slotItem.item = createItemStack(offhandStack);
+            slotsList.add(slotItem);
+        }
+
+        state.slots = slotsList.toArray(new TickData.SlotItem[0]);
+
+        // Capture cursor stack (item held by mouse)
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client.currentScreen instanceof HandledScreen) {
+            HandledScreen<?> handledScreen = (HandledScreen<?>) client.currentScreen;
+            ItemStack cursorStack = handledScreen.getScreenHandler().getCursorStack();
+            if (!cursorStack.isEmpty()) {
+                state.cursorStack = createItemStack(cursorStack);
+            }
         }
 
         return state;
@@ -446,16 +634,16 @@ public class RecordingManager {
             HandledScreen<?> handledScreen = (HandledScreen<?>) currentScreen;
             ScreenHandler handler = handledScreen.getScreenHandler();
 
-            // Get hovered slot using reflection (focusedSlot is protected in 1.16.5)
-            try {
-                java.lang.reflect.Field focusedSlotField = HandledScreen.class.getDeclaredField("focusedSlot");
-                focusedSlotField.setAccessible(true);
-                Slot focusedSlot = (Slot) focusedSlotField.get(handledScreen);
-                if (focusedSlot != null) {
-                    state.hoveredSlotIndex = focusedSlot.id;
+            // Get hovered slot using cached reflection field
+            if (focusedSlotField != null) {
+                try {
+                    Slot focusedSlot = (Slot) focusedSlotField.get(handledScreen);
+                    if (focusedSlot != null) {
+                        state.hoveredSlotIndex = focusedSlot.id;
+                    }
+                } catch (Exception e) {
+                    // Failed to get focused slot, skip it
                 }
-            } catch (Exception e) {
-                // Failed to get focused slot, skip it
             }
 
             // Capture container contents (slots that don't belong to player inventory)
@@ -490,7 +678,7 @@ public class RecordingManager {
             target.type = "block";
             target.blockPos = new TickData.BlockPos(pos.getX(), pos.getY(), pos.getZ());
 
-            Identifier blockId = Registry.BLOCK.getId(client.world.getBlockState(pos).getBlock());
+            Identifier blockId = Registries.BLOCK.getId(client.world.getBlockState(pos).getBlock());
             target.blockId = blockId.toString();
 
         } else if (hitResult.getType() == HitResult.Type.ENTITY) {
@@ -498,7 +686,7 @@ public class RecordingManager {
             Entity entity = entityHit.getEntity();
 
             target.type = "entity";
-            target.entityUuid = entity.getUuidAsString();
+            target.entityUuid = PlayerAnonymizer.getInstance().anonymizeUuid(entity.getUuidAsString());
             target.entityType = entity.getType().toString();
 
         } else {
@@ -509,102 +697,80 @@ public class RecordingManager {
     }
 
     private TickData.ItemStack createItemStack(ItemStack stack) {
-        Identifier itemId = Registry.ITEM.getId(stack.getItem());
+        Identifier itemId = Registries.ITEM.getId(stack.getItem());
         String id = itemId.toString();
         int count = stack.getCount();
 
-        // Extract metadata
-        Integer damage = null;
-        Integer maxDamage = null;
+        TickData.ItemStack item = new TickData.ItemStack(id, count);
+
+        // Durability (damage and percentage)
         if (stack.isDamageable()) {
-            damage = stack.getDamage();
-            maxDamage = stack.getMaxDamage();
+            item.damage = stack.getDamage();
+            item.maxDamage = stack.getMaxDamage();
+
+            // Calculate durability as 0-1 (1.0 = pristine, 0.0 = broken)
+            // durability = (maxDamage - damage) / maxDamage
+            if (item.maxDamage > 0) {
+                item.durability = (float) (item.maxDamage - item.damage) / item.maxDamage;
+            }
         }
 
-        String customName = null;
-        if (stack.hasCustomName()) {
-            customName = stack.getName().getString();
-        }
-
-        String[] enchantments = null;
+        // Enchantments
         if (stack.hasEnchantments()) {
             net.minecraft.nbt.NbtList enchantList = stack.getEnchantments();
-            enchantments = new String[enchantList.size()];
+            java.util.List<TickData.Enchantment> enchantments = new java.util.ArrayList<>();
+
             for (int i = 0; i < enchantList.size(); i++) {
                 net.minecraft.nbt.NbtCompound enchant = enchantList.getCompound(i);
                 String enchantId = enchant.getString("id");
                 int level = enchant.getInt("lvl");
-                enchantments[i] = enchantId + ":" + level;
+
+                TickData.Enchantment e = new TickData.Enchantment();
+                e.id = enchantId;
+                e.level = level;
+                enchantments.add(e);
             }
+
+            item.enchantments = enchantments.toArray(new TickData.Enchantment[0]);
         }
 
-        return new TickData.ItemStack(id, count, damage, maxDamage, customName, enchantments);
+        return item;
     }
 
-    private boolean inventoryEquals(TickData.InventoryState a, TickData.InventoryState b) {
-        // Compare main inventory
-        if (!itemArrayEquals(a.mainInventory, b.mainInventory)) return false;
-        // Compare armor
-        if (!itemArrayEquals(a.armor, b.armor)) return false;
-        // Compare offhand
-        return itemStackEquals(a.offhand, b.offhand);
-    }
-
-    private boolean itemArrayEquals(TickData.ItemStack[] a, TickData.ItemStack[] b) {
-        if (a.length != b.length) return false;
-        for (int i = 0; i < a.length; i++) {
-            if (!itemStackEquals(a[i], b[i])) return false;
-        }
-        return true;
-    }
-
-    private boolean itemStackEquals(TickData.ItemStack a, TickData.ItemStack b) {
-        if (a == null && b == null) return true;
-        if (a == null || b == null) return false;
-
-        if (!a.id.equals(b.id)) return false;
-        if (a.count != b.count) return false;
-
-        // Compare damage
-        if (a.damage == null ? b.damage != null : !a.damage.equals(b.damage)) return false;
-        if (a.maxDamage == null ? b.maxDamage != null : !a.maxDamage.equals(b.maxDamage)) return false;
-
-        // Compare custom name
-        if (a.customName == null ? b.customName != null : !a.customName.equals(b.customName)) return false;
-
-        // Compare enchantments
-        if (a.enchantments == null && b.enchantments == null) return true;
-        if (a.enchantments == null || b.enchantments == null) return false;
-        if (a.enchantments.length != b.enchantments.length) return false;
-        for (int i = 0; i < a.enchantments.length; i++) {
-            if (!a.enchantments[i].equals(b.enchantments[i])) return false;
-        }
-
-        return true;
-    }
+    // Note: Inventory comparison methods removed - we now capture inventory every tick (no delta encoding)
 
     private void captureContainerContents(TickData.GuiState state, ScreenHandler handler, ClientPlayerEntity player) {
-        // Count non-player slots (container slots)
+        // Count non-player slots (container slots start at beginning, player inventory at end)
         int playerInvStart = handler.slots.size() - 36; // Last 36 slots are usually player inventory
         if (playerInvStart <= 0) {
             return; // No container slots
         }
 
-        // Capture container slots only (exclude player inventory)
-        java.util.List<TickData.ItemStack> containerItems = new java.util.ArrayList<>();
+        // Detect container type from handler class name
+        String handlerName = handler.getClass().getSimpleName();
+        String containerType = handlerName.replace("ScreenHandler", "").toLowerCase();
+        containerType = "minecraft:" + containerType;
+
+        // Capture container data
+        TickData.ContainerData container = new TickData.ContainerData();
+        container.type = containerType;
+        container.size = playerInvStart;
+
+        // Capture non-empty container slots
+        java.util.List<TickData.SlotItem> containerSlots = new java.util.ArrayList<>();
         for (int i = 0; i < playerInvStart; i++) {
             Slot slot = handler.slots.get(i);
             ItemStack stack = slot.getStack();
             if (!stack.isEmpty()) {
-                containerItems.add(createItemStack(stack));
-            } else {
-                containerItems.add(null); // Preserve slot indices
+                TickData.SlotItem slotItem = new TickData.SlotItem();
+                slotItem.slot = i;
+                slotItem.item = createItemStack(stack);
+                containerSlots.add(slotItem);
             }
         }
 
-        if (!containerItems.isEmpty()) {
-            state.containerContents = containerItems.toArray(new TickData.ItemStack[0]);
-        }
+        container.slots = containerSlots.toArray(new TickData.SlotItem[0]);
+        state.container = container;
     }
 
     private void captureCraftingState(TickData.GuiState state, ScreenHandler handler) {
@@ -612,38 +778,47 @@ public class RecordingManager {
 
         // Detect crafting screens (CraftingTableScreenHandler, PlayerScreenHandler)
         if (handlerName.contains("Crafting") || handlerName.contains("Player")) {
-            // Find crafting grid and result slots
+            TickData.CraftingData crafting = new TickData.CraftingData();
+
             // Crafting table: 3x3 grid (slots 1-9) + result (slot 0)
             // Player inventory: 2x2 grid (slots 1-4) + result (slot 0)
+            boolean isCraftingTable = handlerName.contains("CraftingTable");
+            crafting.largeCraftingGrid = isCraftingTable;
 
-            int gridSize = handlerName.contains("CraftingTable") ? 9 : 4;
-            java.util.List<TickData.ItemStack> gridItems = new java.util.ArrayList<>();
+            int gridSize = isCraftingTable ? 9 : 4;
+            java.util.List<TickData.SlotItem> gridSlots = new java.util.ArrayList<>();
 
+            // Capture non-empty crafting grid slots
             for (int i = 1; i <= gridSize; i++) {
                 if (i < handler.slots.size()) {
                     ItemStack stack = handler.slots.get(i).getStack();
-                    gridItems.add(!stack.isEmpty() ? createItemStack(stack) : null);
+                    if (!stack.isEmpty()) {
+                        TickData.SlotItem slotItem = new TickData.SlotItem();
+                        slotItem.slot = i - 1; // 0-indexed for crafting grid
+                        slotItem.item = createItemStack(stack);
+                        gridSlots.add(slotItem);
+                    }
                 }
             }
 
-            if (!gridItems.isEmpty()) {
-                state.craftingGrid = gridItems.toArray(new TickData.ItemStack[0]);
-            }
+            crafting.craftingGrid = gridSlots.toArray(new TickData.SlotItem[0]);
 
             // Capture crafting result (slot 0)
             if (!handler.slots.isEmpty()) {
                 ItemStack resultStack = handler.slots.get(0).getStack();
                 if (!resultStack.isEmpty()) {
-                    state.craftingOutput = createItemStack(resultStack);
+                    crafting.result = createItemStack(resultStack);
                 }
             }
+
+            state.crafting = crafting;
         }
     }
 
     // Phase 4: Block State Serialization (CRITICAL for rotation, facing, etc.)
     private String serializeBlockStateProperties(BlockState blockState) {
         // Convert block state properties to string format: "facing=north,half=bottom,powered=true"
-        com.google.common.collect.ImmutableMap<Property<?>, Comparable<?>> properties = blockState.getEntries();
+        java.util.Map<Property<?>, Comparable<?>> properties = blockState.getEntries();
 
         if (properties.isEmpty()) {
             return null;
@@ -703,7 +878,7 @@ public class RecordingManager {
                     }
 
                     // Block ID
-                    Identifier blockId = Registry.BLOCK.getId(blockState.getBlock());
+                    Identifier blockId = Registries.BLOCK.getId(blockState.getBlock());
                     blockData.blockId = blockId.toString();
 
                     // CRITICAL: Block state properties (rotation, facing, etc.)
@@ -730,8 +905,8 @@ public class RecordingManager {
     private TickData.BlockEntityData captureBlockEntityData(BlockEntity blockEntity) {
         TickData.BlockEntityData data = new TickData.BlockEntityData();
 
-        Identifier typeId = net.minecraft.block.entity.BlockEntityType.getId(blockEntity.getType());
-        data.type = typeId.toString();
+        Identifier typeId = Registries.BLOCK_ENTITY_TYPE.getId(blockEntity.getType());
+        data.type = typeId != null ? typeId.toString() : "unknown";
 
         // Container (chest, barrel, shulker box, etc.)
         if (blockEntity instanceof Inventory) {
@@ -747,28 +922,38 @@ public class RecordingManager {
             }
         }
 
-        // Furnace specific (use reflection for private fields)
+        // Furnace specific (use cached reflection fields)
         if (blockEntity instanceof AbstractFurnaceBlockEntity) {
             AbstractFurnaceBlockEntity furnace = (AbstractFurnaceBlockEntity) blockEntity;
-            try {
-                java.lang.reflect.Field burnTimeField = AbstractFurnaceBlockEntity.class.getDeclaredField("burnTime");
-                burnTimeField.setAccessible(true);
-                data.burnTime = (Integer) burnTimeField.get(furnace);
-
-                java.lang.reflect.Field cookTimeField = AbstractFurnaceBlockEntity.class.getDeclaredField("cookTime");
-                cookTimeField.setAccessible(true);
-                data.cookTime = (Integer) cookTimeField.get(furnace);
-            } catch (Exception e) {
-                // Failed to get furnace data, skip it
+            if (burnTimeField != null && cookTimeField != null) {
+                try {
+                    data.burnTime = (Integer) burnTimeField.get(furnace);
+                    data.cookTime = (Integer) cookTimeField.get(furnace);
+                } catch (Exception e) {
+                    // Failed to get furnace data, skip it
+                }
             }
         }
 
-        // Sign specific
+        // Sign specific (sign API changed in 1.20+, using reflection for 1.19.4 compatibility)
         if (blockEntity instanceof SignBlockEntity) {
             SignBlockEntity sign = (SignBlockEntity) blockEntity;
             data.signText = new String[4];
-            for (int i = 0; i < 4; i++) {
-                data.signText[i] = sign.getTextOnRow(i).getString();
+            try {
+                // Try to get messages using reflection (field names may vary)
+                for (int i = 0; i < 4; i++) {
+                    // In 1.19.4, signs still use getTextOnRow method
+                    try {
+                        java.lang.reflect.Method getTextOnRow = SignBlockEntity.class.getMethod("getTextOnRow", int.class);
+                        net.minecraft.text.Text text = (net.minecraft.text.Text) getTextOnRow.invoke(sign, i);
+                        data.signText[i] = text != null ? text.getString() : "";
+                    } catch (NoSuchMethodException e) {
+                        // If method doesn't exist, try accessing text field directly
+                        data.signText[i] = "";
+                    }
+                }
+            } catch (Exception e) {
+                // Failed to get sign text, skip it
             }
         }
 
@@ -826,8 +1011,8 @@ public class RecordingManager {
 
             // Create entity data
             TickData.EntityData entityData = new TickData.EntityData();
-            entityData.uuid = entity.getUuidAsString();
-            entityData.type = Registry.ENTITY_TYPE.getId(entity.getType()).toString();
+            entityData.uuid = PlayerAnonymizer.getInstance().anonymizeUuid(entity.getUuidAsString());
+            entityData.type = Registries.ENTITY_TYPE.getId(entity.getType()).toString();
             entityData.x = entity.getX();
             entityData.y = entity.getY();
             entityData.z = entity.getZ();
@@ -838,7 +1023,12 @@ public class RecordingManager {
             entityData.onFire = entity.isOnFire();
             entityData.invisible = entity.isInvisible();
             if (entity.hasCustomName()) {
-                entityData.customName = entity.getCustomName().getString();
+                // Only anonymize if it's a player entity
+                String customName = entity.getCustomName().getString();
+                if (entity instanceof net.minecraft.entity.player.PlayerEntity) {
+                    customName = PlayerAnonymizer.getInstance().anonymizeName(customName);
+                }
+                entityData.customName = customName;
             }
 
             // Living entity specific data
@@ -1010,99 +1200,17 @@ public class RecordingManager {
     // Phase 4.1: Event-based World Tracking
     // ========================================
 
-    /**
-     * Called when a block is rendered (added to chunk render mesh).
-     * This captures what blocks the player can actually SEE.
-     * Blocks are batched to prevent queue overflow.
-     */
-    public void onBlockRendered(World world, BlockPos pos, BlockState state) {
-        if (!isRecording.get()) {
-            return;
-        }
-
-        try {
-            Identifier dimensionId = world.getRegistryKey().getValue();
-            String dimension = dimensionId.toString();
-            String blockKey = buildBlockKey(dimension, pos.getX(), pos.getY(), pos.getZ());
-
-            // Check if we've already seen this block
-            if (masterBlockMap.containsKey(blockKey)) {
-                return; // Already in master map, no need to re-record
-            }
-
-            // Create block data
-            WorldEvent.BlockData blockData = new WorldEvent.BlockData();
-            blockData.dimension = dimension;
-            blockData.x = pos.getX();
-            blockData.y = pos.getY();
-            blockData.z = pos.getZ();
-            blockData.blockId = Registry.BLOCK.getId(state.getBlock()).toString();
-            blockData.blockStateProperties = serializeBlockStateProperties(state);
-
-            // Capture block entity data if present
-            BlockEntity blockEntity = world.getBlockEntity(pos);
-            if (blockEntity != null && config.captureBlockEntities) {
-                blockData.blockEntity = captureBlockEntityData(blockEntity);
-            }
-
-            // Add to master map
-            masterBlockMap.put(blockKey, blockData);
-
-            // Add to batch buffer instead of writing immediately
-            blockBatchBuffer.put(blockKey, blockData);
-
-            // Flush batch if it gets too large
-            if (blockBatchBuffer.size() >= BATCH_SIZE) {
-                flushBlockBatch();
-            }
-        } catch (Exception e) {
-            System.err.println("[Blockscope] Error in onBlockRendered: " + e.getMessage());
-        }
-    }
+    // Reusable Gson instance to avoid creating new ones every flush
+    private static final com.google.gson.Gson gson = new com.google.gson.Gson();
 
     /**
-     * Flush accumulated block_seen events to disk.
-     * Writes all batched blocks as individual events (for compatibility with existing data format).
+     * Record camera state each tick for visualizer to compute visibility.
+     * Replaces old block iteration - now visualizer computes what's visible from chunks + camera.
      */
-    private void flushBlockBatch() {
-        synchronized (batchLock) {
-            if (blockBatchBuffer.isEmpty()) {
-                return;
-            }
-
-            // Write all batched blocks
-            int tick = (int) currentTick.get();
-            for (WorldEvent.BlockData blockData : blockBatchBuffer.values()) {
-                WorldEvent event = new WorldEvent();
-                event.tick = tick;
-                event.event = "block_seen";
-                event.dimension = blockData.dimension;
-                event.x = blockData.x;
-                event.y = blockData.y;
-                event.z = blockData.z;
-                event.blockId = blockData.blockId;
-                event.blockStateProperties = blockData.blockStateProperties;
-                event.blockEntity = blockData.blockEntity;
-
-                // Use direct write to bypass queue
-                try {
-                    com.google.gson.Gson gson = new com.google.gson.Gson();
-                    String json = gson.toJson(event);
-                    writer.writeDirectly(worldEventsFile, json);
-                } catch (Exception e) {
-                    System.err.println("[Blockscope] Error writing batched block event: " + e.getMessage());
-                }
-            }
-
-            int batchSize = blockBatchBuffer.size();
-            blockBatchBuffer.clear();
-            System.out.println("[Blockscope] Flushed " + batchSize + " block_seen events");
-        }
-    }
 
     /**
      * Called when a block changes (player breaks/places, piston moves, etc.).
-     * This captures block updates as diffs.
+     * Records block updates for ML to learn player actions.
      */
     public void onBlockChanged(World world, BlockPos pos, BlockState oldState, BlockState newState) {
         if (!isRecording.get()) {
@@ -1112,152 +1220,269 @@ public class RecordingManager {
         try {
             Identifier dimensionId = world.getRegistryKey().getValue();
             String dimension = dimensionId.toString();
-            String blockKey = buildBlockKey(dimension, pos.getX(), pos.getY(), pos.getZ());
 
-            // Update master map
-            if (newState.isAir()) {
-                // Block was removed
-                masterBlockMap.remove(blockKey);
-            } else {
-                // Block was changed/placed
-                WorldEvent.BlockData blockData = new WorldEvent.BlockData();
-                blockData.dimension = dimension;
-                blockData.x = pos.getX();
-                blockData.y = pos.getY();
-                blockData.z = pos.getZ();
-                blockData.blockId = Registry.BLOCK.getId(newState.getBlock()).toString();
-                blockData.blockStateProperties = serializeBlockStateProperties(newState);
+            // Create simple block change event (JSONL format)
+            com.google.gson.JsonObject event = new com.google.gson.JsonObject();
+            event.addProperty("tick", (int) currentTick.get());
+            event.addProperty("dimension", dimension);
+            event.addProperty("x", pos.getX());
+            event.addProperty("y", pos.getY());
+            event.addProperty("z", pos.getZ());
+            event.addProperty("blockId", Registries.BLOCK.getId(newState.getBlock()).toString());
 
-                BlockEntity blockEntity = world.getBlockEntity(pos);
-                if (blockEntity != null && config.captureBlockEntities) {
-                    blockData.blockEntity = captureBlockEntityData(blockEntity);
-                }
-
-                masterBlockMap.put(blockKey, blockData);
+            String props = serializeBlockStateProperties(newState);
+            if (props != null) {
+                event.addProperty("blockStateProperties", props);
             }
 
-            // Write "block_changed" event
-            WorldEvent event = new WorldEvent();
-            event.tick = (int) currentTick.get();
-            event.event = "block_changed";
-            event.dimension = dimension;
-            event.x = pos.getX();
-            event.y = pos.getY();
-            event.z = pos.getZ();
-            event.blockId = Registry.BLOCK.getId(newState.getBlock()).toString();
-            event.blockStateProperties = serializeBlockStateProperties(newState);
-
-            writeWorldEvent(event);
+            if (blockChangesWriter != null) {
+                blockChangesWriter.writeLine(event.toString());
+            }
         } catch (Exception e) {
             System.err.println("[Blockscope] Error in onBlockChanged: " + e.getMessage());
         }
     }
 
     /**
-     * Write a world event to world_events.jsonl
+     * Background thread that uploads chunks to server
      */
-    private void writeWorldEvent(WorldEvent event) {
+    private void chunkUploaderLoop() {
+        while (isRecording.get() || !chunkUploadQueue.isEmpty()) {
+            try {
+                ChunkUploadTask task = chunkUploadQueue.poll(1, java.util.concurrent.TimeUnit.SECONDS);
+                if (task != null) {
+                    uploadChunk(task);
+                }
+            } catch (InterruptedException e) {
+                break;
+            }
+        }
+        System.out.println("[Blockscope] Chunk uploader thread exiting");
+    }
+
+    /**
+     * Upload a chunk to the server
+     */
+    private void uploadChunk(ChunkUploadTask task) {
         try {
-            com.google.gson.Gson gson = new com.google.gson.Gson();
-            String json = gson.toJson(event);
-            writer.writeJsonLine(worldEventsFile, json);
+            String url = config.serverUrl + "/upload-chunk?session_id=" + sessionId +
+                         "&chunkX=" + task.chunkX + "&chunkZ=" + task.chunkZ +
+                         "&tick=" + task.tick + "&dimension=" + java.net.URLEncoder.encode(task.dimension, "UTF-8");
+
+            java.net.HttpURLConnection conn = (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
+            conn.setDoOutput(true);
+            conn.setRequestMethod("POST");
+            conn.setRequestProperty("Content-Type", "application/octet-stream");
+            conn.setRequestProperty("Content-Length", String.valueOf(task.nbtData.length));
+
+            try (java.io.OutputStream out = conn.getOutputStream()) {
+                out.write(task.nbtData);
+            }
+
+            int responseCode = conn.getResponseCode();
+            if (responseCode == 200) {
+                System.out.println("[Blockscope] Uploaded chunk (" + task.chunkX + "," + task.chunkZ + ")");
+            } else {
+                System.err.println("[Blockscope] Chunk upload failed: HTTP " + responseCode);
+            }
+
+            conn.disconnect();
         } catch (Exception e) {
-            System.err.println("[Blockscope] Error writing world event: " + e.getMessage());
+            System.err.println("[Blockscope] Error uploading chunk: " + e.getMessage());
         }
     }
 
     /**
-     * Build a unique key for the block map: "dimension:x:y:z"
+     * Write a world event to world_events.jsonl
      */
-    private String buildBlockKey(String dimension, int x, int y, int z) {
-        return dimension + ":" + x + ":" + y + ":" + z;
+    private void uploadMetadataToServer() {
+        try {
+            java.net.URL url = new java.net.URL(config.serverUrl + "/upload-metadata?session_id=" + sessionId);
+            java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+
+            conn.setDoOutput(true);
+            conn.setRequestMethod("POST");
+            conn.setRequestProperty("Content-Type", "application/json");
+
+            byte[] metadataBytes = metadata.toJson().getBytes();
+
+            try (java.io.OutputStream out = conn.getOutputStream()) {
+                out.write(metadataBytes);
+            }
+
+            int responseCode = conn.getResponseCode();
+            if (responseCode == 200) {
+                System.out.println("[Blockscope] Uploaded metadata.json to server");
+            } else {
+                System.err.println("[Blockscope] Failed to upload metadata: HTTP " + responseCode);
+            }
+
+            conn.disconnect();
+        } catch (Exception e) {
+            System.err.println("[Blockscope] Error uploading metadata to server: " + e.getMessage());
+        }
     }
 
+
+
+
     /**
-     * Write a periodic snapshot of nearby blocks and entities.
-     * This prevents unbounded diff chains and ensures data integrity.
-     * Called every 1200 ticks (~1 minute).
+     * Called when a chunk loads from server packet (from ClientChunkManagerMixin).
+     * Also called on already-loaded chunks when recording starts.
+     * Saves chunk block data as compressed NBT (nbt parameter unused, we serialize from chunk).
      */
-    private void writePeriodicSnapshot(ClientPlayerEntity player, World world, long tick) {
+    public void onChunkLoad(net.minecraft.world.chunk.WorldChunk chunk, net.minecraft.nbt.NbtCompound nbt) {
+        if (!isRecording.get() || chunk == null) {
+            return;
+        }
+
         try {
-            Identifier dimensionId = world.getRegistryKey().getValue();
+            long chunkArrivalTick = currentTick.get();
+            net.minecraft.world.World world = chunk.getWorld();
+            if (world == null) {
+                return;
+            }
+
+            net.minecraft.util.Identifier dimensionId = world.getRegistryKey().getValue();
             String dimension = dimensionId.toString();
+            net.minecraft.util.math.ChunkPos chunkPos = chunk.getPos();
 
-            BlockPos playerPos = player.getBlockPos();
-            int radius = config.blockCaptureRadius;
+            // Check if we've already saved this chunk (only save once)
+            String chunkKey = dimension + ":" + chunkPos.x + ":" + chunkPos.z;
+            if (savedChunks.containsKey(chunkKey)) {
+                return; // Already saved
+            }
 
-            // Collect blocks within 8x8x8 cube around player
-            java.util.List<WorldEvent.BlockData> nearbyBlocks = new java.util.ArrayList<>();
-            for (int x = -radius; x <= radius; x++) {
-                for (int y = -radius; y <= radius; y++) {
-                    for (int z = -radius; z <= radius; z++) {
-                        BlockPos pos = playerPos.add(x, y, z);
-                        String blockKey = buildBlockKey(dimension, pos.getX(), pos.getY(), pos.getZ());
+            // Create NBT compound with chunk sections
+            net.minecraft.nbt.NbtCompound chunkNbt = new net.minecraft.nbt.NbtCompound();
+            net.minecraft.nbt.NbtList sectionsNbt = new net.minecraft.nbt.NbtList();
 
-                        // Check if this block is in our master map (we've seen it)
-                        WorldEvent.BlockData blockData = masterBlockMap.get(blockKey);
-                        if (blockData != null) {
-                            nearbyBlocks.add(blockData);
+            // Get chunk sections (1.19.4)
+            net.minecraft.world.chunk.ChunkSection[] sections = chunk.getSectionArray();
+            int bottomY = world.getBottomY();
+
+            for (int i = 0; i < sections.length; i++) {
+                net.minecraft.world.chunk.ChunkSection section = sections[i];
+                if (section == null || section.isEmpty()) {
+                    continue;
+                }
+
+                net.minecraft.nbt.NbtCompound sectionNbt = new net.minecraft.nbt.NbtCompound();
+                sectionNbt.putByte("Y", (byte) (bottomY / 16 + i));
+
+                // Save block states
+                net.minecraft.nbt.NbtCompound blockStatesNbt = new net.minecraft.nbt.NbtCompound();
+                net.minecraft.nbt.NbtList paletteNbt = new net.minecraft.nbt.NbtList();
+
+                // Build palette of unique block states in this section
+                java.util.Map<net.minecraft.block.BlockState, Integer> palette = new java.util.HashMap<>();
+                java.util.List<net.minecraft.block.BlockState> paletteList = new java.util.ArrayList<>();
+
+                for (int y = 0; y < 16; y++) {
+                    for (int z = 0; z < 16; z++) {
+                        for (int x = 0; x < 16; x++) {
+                            net.minecraft.block.BlockState state = section.getBlockState(x, y, z);
+                            if (!palette.containsKey(state)) {
+                                palette.put(state, paletteList.size());
+                                paletteList.add(state);
+                            }
                         }
                     }
                 }
-            }
 
-            // Collect nearby entities (reuse existing code for consistency)
-            // Note: This still uses the old Phase 4 code temporarily
-            // TODO: Refactor entity tracking to event-based system like blocks
-            java.util.List<WorldEvent.EntityData> nearbyEntities = new java.util.ArrayList<>();
-            if (config.captureNearbyEntities) {
-                TickData.NearbyEntitiesState entitiesState = captureNearbyEntitiesState(player, world);
-                if (entitiesState != null && entitiesState.entities != null) {
-                    for (TickData.EntityData entityData : entitiesState.entities) {
-                        WorldEvent.EntityData eventEntity = new WorldEvent.EntityData();
-                        eventEntity.uuid = entityData.uuid;
-                        eventEntity.type = entityData.type;
-                        eventEntity.x = entityData.x;
-                        eventEntity.y = entityData.y;
-                        eventEntity.z = entityData.z;
-                        eventEntity.pitch = entityData.pitch;
-                        eventEntity.yaw = entityData.yaw;
-                        eventEntity.health = entityData.health;
-                        eventEntity.maxHealth = entityData.maxHealth;
-                        // Note: Equipment, item, age, etc. can be added if needed
-                        nearbyEntities.add(eventEntity);
+                // Write palette
+                for (net.minecraft.block.BlockState state : paletteList) {
+                    net.minecraft.nbt.NbtCompound stateNbt = new net.minecraft.nbt.NbtCompound();
+                    stateNbt.putString("Name", net.minecraft.registry.Registries.BLOCK.getId(state.getBlock()).toString());
+
+                    // Add properties if present
+                    if (!state.getEntries().isEmpty()) {
+                        net.minecraft.nbt.NbtCompound propsNbt = new net.minecraft.nbt.NbtCompound();
+                        for (java.util.Map.Entry<net.minecraft.state.property.Property<?>, Comparable<?>> entry : state.getEntries().entrySet()) {
+                            propsNbt.putString(entry.getKey().getName(), entry.getValue().toString());
+                        }
+                        stateNbt.put("Properties", propsNbt);
                     }
+
+                    paletteNbt.add(stateNbt);
                 }
+
+                blockStatesNbt.put("palette", paletteNbt);
+
+                // Pack block indices into data array (standard Minecraft NBT format)
+                if (paletteList.size() > 1) {
+                    // Calculate bits needed per block
+                    int bitsPerBlock = Math.max(4, 32 - Integer.numberOfLeadingZeros(paletteList.size() - 1));
+                    int blocksPerLong = 64 / bitsPerBlock;
+
+                    // Pack block indices into long array (Y-Z-X order like Minecraft)
+                    long[] data = new long[(4096 + blocksPerLong - 1) / blocksPerLong];
+                    int index = 0;
+                    for (int y = 0; y < 16; y++) {
+                        for (int z = 0; z < 16; z++) {
+                            for (int x = 0; x < 16; x++) {
+                                net.minecraft.block.BlockState state = section.getBlockState(x, y, z);
+                                int paletteIndex = palette.get(state);
+                                int longIndex = index / blocksPerLong;
+                                int bitIndex = (index % blocksPerLong) * bitsPerBlock;
+                                data[longIndex] |= (long)paletteIndex << bitIndex;
+                                index++;
+                            }
+                        }
+                    }
+                    blockStatesNbt.putLongArray("data", data);
+                }
+                // If palette size == 1, no data array needed (entire section is one block)
+
+                sectionNbt.put("block_states", blockStatesNbt);
+                sectionsNbt.add(sectionNbt);
             }
 
-            // Create snapshot event
-            WorldEvent snapshotEvent = new WorldEvent();
-            snapshotEvent.tick = (int) tick;
-            snapshotEvent.event = "snapshot";
+            chunkNbt.put("sections", sectionsNbt);
 
-            WorldEvent.SnapshotData snapshotData = new WorldEvent.SnapshotData();
-            snapshotData.nearbyBlocks = nearbyBlocks.toArray(new WorldEvent.BlockData[0]);
-            snapshotData.nearbyEntities = nearbyEntities.toArray(new WorldEvent.EntityData[0]);
-            snapshotEvent.snapshot = snapshotData;
+            // Serialize to compressed binary
+            java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+            try {
+                net.minecraft.nbt.NbtIo.writeCompressed(chunkNbt, baos);
+                byte[] nbtBytes = baos.toByteArray();
 
-            writeWorldEvent(snapshotEvent);
-
-            System.out.println("[Blockscope] Periodic snapshot written: " + nearbyBlocks.size() + " blocks, " + nearbyEntities.size() + " entities");
+                // Queue for async upload
+                ChunkUploadTask task = new ChunkUploadTask(dimension, chunkPos.x, chunkPos.z, chunkArrivalTick, nbtBytes);
+                if (!chunkUploadQueue.offer(task)) {
+                    System.err.println("[Blockscope] Chunk upload queue full! Dropped chunk " + chunkPos);
+                } else {
+                    savedChunks.put(chunkKey, true);
+                    System.out.println("[Blockscope] Queued chunk " + chunkPos + " (" + nbtBytes.length + " bytes)");
+                }
+            } catch (java.io.IOException e) {
+                System.err.println("[Blockscope] Failed to serialize chunk NBT: " + e.getMessage());
+            }
         } catch (Exception e) {
-            System.err.println("[Blockscope] Error writing periodic snapshot: " + e.getMessage());
+            System.err.println("[Blockscope] Error in onChunkLoad: " + e.getMessage());
             e.printStackTrace();
         }
     }
 
     /**
-     * Trigger chunk rebuilds to capture all currently visible blocks.
-     * This is called when recording starts to ensure blocks rendered
-     * before pressing R are captured.
+     * Tell server to concatenate TS segments into final MP4
      */
-    private void triggerChunkRebuilds() {
-        MinecraftClient client = MinecraftClient.getInstance();
-        if (client.worldRenderer != null) {
-            // Schedule chunk rebuilds to trigger on next render
-            // This will cause ChunkBuilderMixin to fire for all visible chunks
-            client.worldRenderer.reload();
-            System.out.println("[Blockscope] Triggered chunk rebuilds to capture initial visible blocks");
+    private void finalizeVideo() {
+        try {
+            java.net.URL url = new java.net.URL(config.serverUrl + "/finalize-video?session_id=" + sessionId);
+            java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("POST");
+            conn.setRequestProperty("User-Agent", "Blockscope/1.0");
+
+            int responseCode = conn.getResponseCode();
+            if (responseCode == 200) {
+                System.out.println("[Blockscope] Video finalized successfully");
+            } else {
+                System.err.println("[Blockscope] Video finalization failed: HTTP " + responseCode);
+            }
+
+            conn.disconnect();
+        } catch (Exception e) {
+            System.err.println("[Blockscope] Error finalizing video: " + e.getMessage());
         }
     }
 }

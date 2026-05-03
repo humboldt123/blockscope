@@ -9,7 +9,8 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class AsyncWriter {
-    private final BlockingQueue<WriteTask> queue = new LinkedBlockingQueue<>(1000);
+    // Increased from 1000 to 10000 to prevent queue overflow during heavy recording
+    private final BlockingQueue<WriteTask> queue = new LinkedBlockingQueue<>(10000);
     private final AtomicBoolean running = new AtomicBoolean(false);
     private Thread writerThread;
 

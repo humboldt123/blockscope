@@ -1,5 +1,5 @@
 plugins {
-    id 'fabric-loom' version '1.1-SNAPSHOT'
+    id 'fabric-loom' version '1.2.7'
     id 'maven-publish'
 }
 
@@ -12,6 +12,10 @@ repositories {
     maven {
         name = 'Fabric'
         url = 'https://maven.fabricmc.net/'
+    }
+    maven {
+        name = 'Jitpack'
+        url = 'https://jitpack.io'
     }
 }
 
@@ -38,17 +42,16 @@ processResources {
 }
 
 tasks.withType(JavaCompile).configureEach {
-    // Target Java 8 bytecode for maximum compatibility
     it.options.encoding = 'UTF-8'
+    it.options.release = 17
 }
 
 java {
     toolchain {
-        // Use Java 17 for running, but compile to Java 8 bytecode for compatibility
-        languageVersion = JavaLanguageVersion.of(8)
+        languageVersion = JavaLanguageVersion.of(17)
     }
-    sourceCompatibility = JavaVersion.VERSION_1_8
-    targetCompatibility = JavaVersion.VERSION_1_8
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
     withSourcesJar()
 }
 

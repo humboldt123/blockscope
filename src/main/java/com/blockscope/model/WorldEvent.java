@@ -33,10 +33,17 @@ package com.blockscope.model;
  */
 public class WorldEvent {
     public int tick;
-    public String event;  // "block_seen", "block_changed", "entity_seen", "entity_moved", "entity_updated", "snapshot"
+    public String event;  // "chunk_load", "camera_update", "block_changed", etc.
 
-    // Block-related fields (for block_seen, block_changed)
+    // Chunk-related fields (for chunk_packet - raw NBT from server)
     public String dimension;
+    public Integer chunkX, chunkZ;
+    public String chunkNbt; // Raw NBT packet data as string (ReplayMod approach)
+
+    // Camera-related fields (for camera_update - recorded each tick)
+    public CameraData camera;
+
+    // Block-related fields (for block_changed)
     public Integer x, y, z;
     public String blockId;
     public String blockStateProperties;  // Rotation, facing, powered, etc.
@@ -56,6 +63,13 @@ public class WorldEvent {
 
     // Snapshot fields (for periodic full dumps)
     public SnapshotData snapshot;
+
+    public static class CameraData {
+        public double x, y, z;
+        public float pitch, yaw;
+        public float fov;
+        public String perspective;  // "first_person", "third_person_back", "third_person_front"
+    }
 
     public static class SnapshotData {
         public BlockData[] nearbyBlocks;     // All blocks within 8x8x8

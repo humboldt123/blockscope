@@ -1,4 +1,6 @@
 {
   "key.blockscope.toggle_recording": "Toggle Recording",
+  "key.blockscope.config": "Open Config",
+  "key.blockscope.chaos_agent": "Toggle Chaos Agent",
   "category.blockscope": "Blockscope"
 }

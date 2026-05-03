@@ -46,6 +46,18 @@ public class TickData {
         // Accessibility/gameplay settings
         public boolean showSubtitles;   // Captions enabled (visual sound indicators)
         public boolean autoJumpEnabled; // Auto-jump setting (disabled by mod for 1.8.9 compatibility)
+
+        // Active status effects
+        public StatusEffect[] statusEffects; // Active potion effects (speed, strength, etc.)
+    }
+
+    public static class StatusEffect {
+        public String effectId;     // e.g. "minecraft:speed"
+        public int amplifier;       // Effect level (0 = I, 1 = II, etc.)
+        public int duration;        // Remaining ticks
+        public boolean ambient;     // From beacon (less visual particles)
+        public boolean showParticles;
+        public boolean showIcon;
     }
 
     public static class WorldState {
@@ -57,19 +69,45 @@ public class TickData {
     }
 
     public static class InventoryState {
-        public ItemStack[] mainInventory; // 36 slots
-        public ItemStack[] armor;         // 4 slots
-        public ItemStack offhand;
+        // Player inventory using Minecraft's slot numbering:
+        // Slots 0-8: Hotbar
+        // Slots 9-35: Main inventory (3 rows of 9)
+        // Slots 36-39: Armor (boots, leggings, chestplate, helmet)
+        // Slot 40: Offhand
+        public SlotItem[] slots; // Only non-empty slots (sparse array representation)
+        public ItemStack cursorStack; // Item held by mouse cursor (null if none)
+    }
+
+    // Represents an item in a specific slot
+    public static class SlotItem {
+        public int slot;      // Slot index
+        public ItemStack item; // The item (never null in this object)
     }
 
     public static class GuiState {
         public String screenType;        // null if no GUI open
         public int cursorX, cursorY;
-        public Integer hoveredSlotIndex; // Index of hovered slot in current screen
-        public ItemStack[] containerContents; // Container items (chest, furnace, etc.) - null if not a container
-        public ItemStack[] craftingGrid;      // Crafting grid items (2x2 or 3x3) - null if not crafting
-        public ItemStack craftingOutput;      // Crafting result slot - null if not crafting
-        public boolean recipeBookOpen;        // Recipe book visibility
+        public Integer hoveredSlotIndex; // Slot index of hovered slot
+
+        // Container data (chest, furnace, hopper, etc.)
+        public ContainerData container; // null if not viewing a container
+
+        // Crafting data (when player inventory is open or at crafting table)
+        public CraftingData crafting;   // null if no crafting grid visible
+
+        public boolean recipeBookOpen;  // Recipe book visibility
+    }
+
+    public static class ContainerData {
+        public String type;              // "minecraft:chest", "minecraft:furnace", "minecraft:hopper", etc.
+        public SlotItem[] slots;         // Container slots (only non-empty slots)
+        public Integer size;             // Total container size (e.g., 27 for chest, 5 for hopper)
+    }
+
+    public static class CraftingData {
+        public SlotItem[] craftingGrid;  // Crafting input slots (only non-empty)
+        public ItemStack result;         // Crafting result slot (null if no result)
+        public boolean largeCraftingGrid; // true = 3x3 (crafting table), false = 2x2 (inventory)
     }
 
     public static class CrosshairTarget {
@@ -93,24 +131,20 @@ public class TickData {
     public static class ItemStack {
         public String id;
         public int count;
-        public Integer damage;          // Item damage/durability (null if not applicable)
-        public Integer maxDamage;       // Max durability (null if not damageable)
-        public String customName;       // Custom item name (null if none)
-        public String[] enchantments;   // Array of enchantment strings (null if none)
+        public Integer damage;          // Current damage value (null if not damageable)
+        public Integer maxDamage;       // Max damage value (null if not damageable)
+        public Float durability;        // Durability as 0-1 (1.0 = pristine, 0.0 = broken, null if not damageable)
+        public Enchantment[] enchantments; // Enchantments (null if none)
 
         public ItemStack(String id, int count) {
             this.id = id;
             this.count = count;
         }
+    }
 
-        public ItemStack(String id, int count, Integer damage, Integer maxDamage, String customName, String[] enchantments) {
-            this.id = id;
-            this.count = count;
-            this.damage = damage;
-            this.maxDamage = maxDamage;
-            this.customName = customName;
-            this.enchantments = enchantments;
-        }
+    public static class Enchantment {
+        public String id;    // e.g. "minecraft:sharpness"
+        public int level;    // Enchantment level (1 = I, 2 = II, etc.)
     }
 
     // Phase 4: Nearby Entity State

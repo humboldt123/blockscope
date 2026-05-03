@@ -17,15 +17,18 @@ public class Config {
     public boolean showChatMessages = true; // Show recording start/stop messages in chat
     public boolean showRecordingOverlay = true; // Show recording indicator overlay
 
+    // Upload server configuration (localhost for debugging)
+    public String serverUrl = "http://localhost:9000";
+
     // Phase 4: Entity capture settings
     public boolean captureNearbyEntities = true;
-    public int entityCaptureRadius = 32;          // blocks
+    public int entityCaptureRadius = 16;          // blocks (reduced from 32 for performance)
     public boolean captureAllEntities = true;     // If false, only living entities
     public boolean captureItemEntities = true;    // Item drops
 
     // Phase 4: Block capture settings
     public boolean captureNearbyBlocks = true;
-    public int blockCaptureRadius = 8;            // blocks
+    public int blockCaptureRadius = 128;          // blocks (8 chunks) - matches typical render distance
     public boolean captureBlockEntities = true;   // Chests, furnaces, etc.
     public boolean useRelativeBlockPositions = false; // Relative to player vs absolute
 
@@ -59,15 +62,18 @@ public class Config {
             showChatMessages = Boolean.parseBoolean(props.getProperty("show_chat_messages", "true"));
             showRecordingOverlay = Boolean.parseBoolean(props.getProperty("show_recording_overlay", "true"));
 
+            // Upload server
+            serverUrl = props.getProperty("server_url", "https://seattle-ferry-pam-acdbentity.trycloudflare.com");
+
             // Phase 4: Entity capture
             captureNearbyEntities = Boolean.parseBoolean(props.getProperty("capture_nearby_entities", "true"));
-            entityCaptureRadius = Integer.parseInt(props.getProperty("entity_capture_radius", "32"));
+            entityCaptureRadius = Integer.parseInt(props.getProperty("entity_capture_radius", "16"));
             captureAllEntities = Boolean.parseBoolean(props.getProperty("capture_all_entities", "true"));
             captureItemEntities = Boolean.parseBoolean(props.getProperty("capture_item_entities", "true"));
 
             // Phase 4: Block capture
             captureNearbyBlocks = Boolean.parseBoolean(props.getProperty("capture_nearby_blocks", "true"));
-            blockCaptureRadius = Integer.parseInt(props.getProperty("block_capture_radius", "8"));
+            blockCaptureRadius = Integer.parseInt(props.getProperty("block_capture_radius", "128"));
             captureBlockEntities = Boolean.parseBoolean(props.getProperty("capture_block_entities", "true"));
             useRelativeBlockPositions = Boolean.parseBoolean(props.getProperty("use_relative_block_positions", "false"));
 
@@ -86,6 +92,9 @@ public class Config {
             props.setProperty("recording_directory", recordingDirectory);
             props.setProperty("show_chat_messages", String.valueOf(showChatMessages));
             props.setProperty("show_recording_overlay", String.valueOf(showRecordingOverlay));
+
+            // Upload server
+            props.setProperty("server_url", serverUrl);
 
             // Phase 4: Entity capture
             props.setProperty("capture_nearby_entities", String.valueOf(captureNearbyEntities));

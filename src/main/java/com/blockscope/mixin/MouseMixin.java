@@ -2,6 +2,7 @@ package com.blockscope.mixin;
 
 import com.blockscope.model.InputEvent;
 import com.blockscope.recording.RecordingManager;
+import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.Mouse;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
@@ -32,6 +33,13 @@ public class MouseMixin {
 
         if (lastX != 0 || lastY != 0) { // Skip first event (no delta available)
             InputEvent event = InputEvent.mouseMove(0, 0, dx, dy);
+
+            // Capture mouse sensitivity setting
+            MinecraftClient client = MinecraftClient.getInstance();
+            if (client != null && client.options != null) {
+                event.mouseSensitivity = client.options.getMouseSensitivity().getValue();
+            }
+
             RecordingManager.getInstance().recordInputEvent(event);
         }
 

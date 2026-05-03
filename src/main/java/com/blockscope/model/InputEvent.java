@@ -19,6 +19,7 @@ public class InputEvent {
     // For mouse movement
     public Double deltaX;
     public Double deltaY;
+    public Double mouseSensitivity; // Mouse sensitivity setting at time of input
 
     private static final Gson GSON = new GsonBuilder().create();
 

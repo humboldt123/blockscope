@@ -1,5 +1,6 @@
 package com.blockscope;
 
+import com.blockscope.agent.InventoryChaosAgent;
 import com.blockscope.gui.ConfigScreen;
 import com.blockscope.gui.RecordingOverlay;
 import com.blockscope.recording.RecordingManager;
@@ -15,6 +16,7 @@ import org.lwjgl.glfw.GLFW;
 public class BlockscopeClient implements ClientModInitializer {
     private static KeyBinding recordingToggleKey;
     private static KeyBinding configKey;
+    private static KeyBinding chaosAgentKey;
     private static boolean autoJumpDisabled = false;
 
     @Override
@@ -59,12 +61,20 @@ public class BlockscopeClient implements ClientModInitializer {
             "category.blockscope"
         ));
 
+        // Register keybinding for chaos agent
+        chaosAgentKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+            "key.blockscope.chaos_agent",
+            InputUtil.Type.KEYSYM,
+            GLFW.GLFW_KEY_C,
+            "category.blockscope"
+        ));
+
         // Register client tick event
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             // Disable AutoJump once on first tick (for 1.8.9 compatibility)
             if (!autoJumpDisabled && client.options != null) {
-                if (client.options.autoJump) {
-                    client.options.autoJump = false;
+                if (client.options.getAutoJump().getValue()) {
+                    client.options.getAutoJump().setValue(false);
                     client.options.write();
                     System.out.println("[Blockscope] AutoJump disabled for 1.8.9 compatibility");
                 }
@@ -83,7 +93,13 @@ public class BlockscopeClient implements ClientModInitializer {
 
             // Handle config screen keybind
             if (configKey.wasPressed()) {
-                client.openScreen(new ConfigScreen(client.currentScreen));
+                client.setScreen(new ConfigScreen(client.currentScreen));
+            }
+
+            // Handle chaos agent keybind
+            if (chaosAgentKey.wasPressed()) {
+                System.out.println("[Blockscope] C key pressed - toggling chaos agent");
+                InventoryChaosAgent.getInstance().toggle();
             }
 
             // Record tick data if recording

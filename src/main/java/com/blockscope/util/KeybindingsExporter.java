@@ -15,13 +15,13 @@ public class KeybindingsExporter {
         MinecraftClient client = MinecraftClient.getInstance();
         Map<String, KeybindInfo> keybindings = new LinkedHashMap<>();
 
-        for (KeyBinding keybind : client.options.keysAll) {
+        for (KeyBinding keybind : client.options.allKeys) {
             KeybindInfo info = new KeybindInfo();
             info.translationKey = keybind.getTranslationKey();
             info.category = keybind.getCategory();
             info.boundKey = keybind.getBoundKeyTranslationKey();
             info.defaultKey = keybind.getDefaultKey().getTranslationKey();
-            info.isDefault = keybind.getBoundKeyTranslationKey().equals(keybind.getDefaultKey().getTranslationKey());
+            info.isDefault = keybind.isDefault();
 
             keybindings.put(info.translationKey, info);
         }

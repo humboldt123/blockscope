@@ -3,10 +3,8 @@ package com.blockscope.gui;
 import com.blockscope.util.Config;
 import net.minecraft.client.gui.screen.Screen;
 import net.minecraft.client.gui.widget.ButtonWidget;
-import net.minecraft.client.gui.widget.SliderWidget;
 import net.minecraft.client.util.math.MatrixStack;
-import net.minecraft.text.LiteralText;
-import net.minecraft.text.TranslatableText;
+import net.minecraft.text.Text;
 
 public class ConfigScreen extends Screen {
     private final Screen parent;
@@ -21,7 +19,7 @@ public class ConfigScreen extends Screen {
     private boolean showRecordingOverlay;
 
     public ConfigScreen(Screen parent) {
-        super(new LiteralText("Blockscope Configuration"));
+        super(Text.literal("Blockscope Configuration"));
         this.parent = parent;
         this.config = Config.getInstance();
 
@@ -41,71 +39,78 @@ public class ConfigScreen extends Screen {
         int spacing = 25;
 
         // Resolution presets
-        this.addButton(new ButtonWidget(
-            centerX - 100, startY, 200, 20,
-            new LiteralText("Resolution: " + resolutionWidth + "×" + resolutionHeight),
+        this.addDrawableChild(ButtonWidget.builder(
+            Text.literal("Resolution: " + resolutionWidth + "×" + resolutionHeight),
             button -> {
                 cycleResolution();
-                button.setMessage(new LiteralText("Resolution: " + resolutionWidth + "×" + resolutionHeight));
-            }
-        ));
+                button.setMessage(Text.literal("Resolution: " + resolutionWidth + "×" + resolutionHeight));
+            })
+            .dimensions(centerX - 100, startY, 200, 20)
+            .build()
+        );
 
         // Aspect ratio mode
-        this.addButton(new ButtonWidget(
-            centerX - 100, startY + spacing, 200, 20,
-            new LiteralText("Aspect Ratio: " + aspectRatioMode),
+        this.addDrawableChild(ButtonWidget.builder(
+            Text.literal("Aspect Ratio: " + aspectRatioMode),
             button -> {
                 cycleAspectRatioMode();
-                button.setMessage(new LiteralText("Aspect Ratio: " + aspectRatioMode));
-            }
-        ));
+                button.setMessage(Text.literal("Aspect Ratio: " + aspectRatioMode));
+            })
+            .dimensions(centerX - 100, startY + spacing, 200, 20)
+            .build()
+        );
 
         // Target FPS
-        this.addButton(new ButtonWidget(
-            centerX - 100, startY + spacing * 2, 200, 20,
-            new LiteralText("Target FPS: " + targetFps),
+        this.addDrawableChild(ButtonWidget.builder(
+            Text.literal("Target FPS: " + targetFps),
             button -> {
                 cycleFps();
-                button.setMessage(new LiteralText("Target FPS: " + targetFps));
-            }
-        ));
+                button.setMessage(Text.literal("Target FPS: " + targetFps));
+            })
+            .dimensions(centerX - 100, startY + spacing * 2, 200, 20)
+            .build()
+        );
 
         // Chat messages toggle
-        this.addButton(new ButtonWidget(
-            centerX - 100, startY + spacing * 3, 200, 20,
-            new LiteralText("Chat Messages: " + (showChatMessages ? "ON" : "OFF")),
+        this.addDrawableChild(ButtonWidget.builder(
+            Text.literal("Chat Messages: " + (showChatMessages ? "ON" : "OFF")),
             button -> {
                 showChatMessages = !showChatMessages;
-                button.setMessage(new LiteralText("Chat Messages: " + (showChatMessages ? "ON" : "OFF")));
-            }
-        ));
+                button.setMessage(Text.literal("Chat Messages: " + (showChatMessages ? "ON" : "OFF")));
+            })
+            .dimensions(centerX - 100, startY + spacing * 3, 200, 20)
+            .build()
+        );
 
         // Recording overlay toggle
-        this.addButton(new ButtonWidget(
-            centerX - 100, startY + spacing * 4, 200, 20,
-            new LiteralText("Recording Overlay: " + (showRecordingOverlay ? "ON" : "OFF")),
+        this.addDrawableChild(ButtonWidget.builder(
+            Text.literal("Recording Overlay: " + (showRecordingOverlay ? "ON" : "OFF")),
             button -> {
                 showRecordingOverlay = !showRecordingOverlay;
-                button.setMessage(new LiteralText("Recording Overlay: " + (showRecordingOverlay ? "ON" : "OFF")));
-            }
-        ));
+                button.setMessage(Text.literal("Recording Overlay: " + (showRecordingOverlay ? "ON" : "OFF")));
+            })
+            .dimensions(centerX - 100, startY + spacing * 4, 200, 20)
+            .build()
+        );
 
         // Save button
-        this.addButton(new ButtonWidget(
-            centerX - 100, this.height - 50, 95, 20,
-            new LiteralText("Save"),
+        this.addDrawableChild(ButtonWidget.builder(
+            Text.literal("Save"),
             button -> {
                 saveConfig();
-                this.client.openScreen(parent);
-            }
-        ));
+                this.client.setScreen(parent);
+            })
+            .dimensions(centerX - 100, this.height - 50, 95, 20)
+            .build()
+        );
 
         // Cancel button
-        this.addButton(new ButtonWidget(
-            centerX + 5, this.height - 50, 95, 20,
-            new LiteralText("Cancel"),
-            button -> this.client.openScreen(parent)
-        ));
+        this.addDrawableChild(ButtonWidget.builder(
+            Text.literal("Cancel"),
+            button -> this.client.setScreen(parent))
+            .dimensions(centerX + 5, this.height - 50, 95, 20)
+            .build()
+        );
     }
 
     private void cycleResolution() {
@@ -165,18 +170,18 @@ public class ConfigScreen extends Screen {
         this.renderBackground(matrices);
 
         // Title
-        drawCenteredText(matrices, this.textRenderer, this.title, this.width / 2, 20, 0xFFFFFF);
+        drawCenteredTextWithShadow(matrices, this.textRenderer, this.title, this.width / 2, 20, 0xFFFFFF);
 
         // Descriptions
-        drawCenteredText(matrices, this.textRenderer,
-            new LiteralText("§7Video capture resolution"),
+        drawCenteredTextWithShadow(matrices, this.textRenderer,
+            Text.literal("§7Video capture resolution"),
             this.width / 2, 30, 0xFFFFFF);
 
         super.render(matrices, mouseX, mouseY, delta);
     }
 
     @Override
-    public void onClose() {
-        this.client.openScreen(parent);
+    public void close() {
+        this.client.setScreen(parent);
     }
 }
