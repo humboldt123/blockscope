@@ -26,6 +26,9 @@ dependencies {
     modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
     modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
 
+    // ReplayMod as a compile-only dependency (users install it separately)
+    modCompileOnly files('libs/replaymod-1.19.4-2.6.20.jar')
+
     // JCODEC for video encoding - include in JAR (Jar-in-Jar)
     implementation 'org.jcodec:jcodec:0.2.5'
     implementation 'org.jcodec:jcodec-javase:0.2.5'

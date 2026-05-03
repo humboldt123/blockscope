@@ -4,11 +4,9 @@
   "package": "com.blockscope.mixin",
   "compatibilityLevel": "JAVA_17",
   "client": [
-    "GameRendererMixin",
     "KeyboardMixin",
-    "MouseMixin",
-    "WorldChunkMixin",
-    "ClientChunkManagerMixin"
+    "MinecraftClientMixin",
+    "MouseMixin"
   ],
   "injectors": {
     "defaultRequire": 1

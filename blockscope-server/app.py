@@ -46,10 +46,6 @@ async def init_session(session_id: str = Query(...)):
     segments_dir = session_dir / "segments"
     segments_dir.mkdir(exist_ok=True)
 
-    # Create chunks subdirectory for chunk NBT files
-    chunks_dir = session_dir / "chunks"
-    chunks_dir.mkdir(exist_ok=True)
-
     session_last_activity[session_id] = datetime.now()
 
     logger.info(f"Initialized session: {session_id}")
@@ -71,28 +67,6 @@ async def upload_metadata(request: Request, session_id: str = Query(...)):
     logger.info(f"Saved metadata for session {session_id}")
     return {"status": "ok"}
 
-@app.post("/upload-chunk")
-async def upload_chunk(request: Request, session_id: str = Query(...), chunkX: int = Query(...), chunkZ: int = Query(...), tick: int = Query(...), dimension: str = Query(...)):
-    """Receive chunk NBT data (binary, compressed)"""
-    session_dir = DATA_DIR / session_id
-    if not session_dir.exists():
-        return JSONResponse(status_code=404, content={"error": "Session not found"})
-
-    chunks_dir = session_dir / "chunks"
-    # Sanitize dimension name for filename (minecraft:overworld -> overworld)
-    dim_name = dimension.split(":")[-1] if ":" in dimension else dimension
-    chunk_file = chunks_dir / f"chunk_{dim_name}_{chunkX}_{chunkZ}_tick{tick}.nbt"
-
-    # Write binary NBT file
-    body = await request.body()
-    with open(chunk_file, "wb") as f:
-        f.write(body)
-
-    file_size = chunk_file.stat().st_size
-    logger.info(f"Saved chunk ({chunkX},{chunkZ}) at tick {tick} for session {session_id}: {file_size} bytes")
-
-    session_last_activity[session_id] = datetime.now()
-    return {"status": "ok", "chunk": f"{chunkX},{chunkZ}", "size": file_size}
 
 @app.post("/upload-segment")
 async def upload_segment(request: Request, session_id: str = Query(...), segment_index: int = Query(...)):
@@ -144,6 +118,26 @@ async def stream_data(request: Request, session_id: str = Query(...), data_type:
     session_last_activity[session_id] = datetime.now()
 
     return {"status": "ok", "bytes_written": bytes_written}
+
+@app.post("/upload-replay")
+async def upload_replay(request: Request, session_id: str = Query(...), filename: str = Query(...)):
+    """Receive a ReplayMod .mcpr file for the session"""
+    session_dir = DATA_DIR / session_id
+    if not session_dir.exists():
+        session_dir.mkdir(parents=True, exist_ok=True)
+
+    # Strip any path components from the filename for safety
+    safe_name = Path(filename).name
+    replay_file = session_dir / safe_name
+
+    bytes_written = 0
+    with open(replay_file, "wb") as f:
+        async for chunk in request.stream():
+            f.write(chunk)
+            bytes_written += len(chunk)
+
+    logger.info(f"Saved replay {safe_name} for session {session_id}: {bytes_written} bytes")
+    return {"status": "ok", "filename": safe_name, "bytes_written": bytes_written}
 
 @app.post("/finalize")
 @app.post("/finalize-video")

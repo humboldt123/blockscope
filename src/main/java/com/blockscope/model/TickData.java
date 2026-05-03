@@ -5,6 +5,7 @@ import com.google.gson.GsonBuilder;
 
 public class TickData {
     public long tick;
+    public long replayMs;   // milliseconds into the .mcpr recording (from PacketListener.getCurrentDuration)
     public PlayerState player;
     public WorldState world;
     public InventoryState inventory;  // NOTE: Only present when inventory changes (optimization)
@@ -20,9 +21,15 @@ public class TickData {
         return GSON.toJson(this);
     }
 
+    public static class CameraState {
+        public double x, y, z;   // Actual rendered camera position (collision-adjusted in 3rd-person)
+        public float pitch, yaw; // Rendered camera angles (differs from player in third_person_front)
+    }
+
     public static class PlayerState {
         public double x, y, z;
-        public float pitch, yaw;
+        public float pitch, yaw; // Player entity angles (NOT camera angles in F5-front)
+        public CameraState camera; // Actual rendered camera — use this for ray-casting
         public float fov;
         public double mouseSensitivity;
         public float health;
