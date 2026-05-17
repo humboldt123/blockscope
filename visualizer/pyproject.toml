@@ -1,0 +1,14 @@
+[project]
+name = "blockscope-visualizer"
+version = "0.1.0"
+description = "Blockscope replay visualizer - renders Minecraft gameplay recordings with native textures."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.12"
+dependencies = [
+    "moderngl>=5.12.0",
+    "pygame>=2.6.1",
+    "pyglm>=2.8.3",
+    "imgui[pygame]>=2.0.0",
+    "av>=16.0.0",
+]

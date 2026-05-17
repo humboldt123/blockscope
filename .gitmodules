@@ -1,0 +1,6 @@
+[submodule "mods/baritone"]
+	path = mods/baritone
+	url = https://github.com/cabaletta/baritone
+[submodule "mods/replaymod"]
+	path = mods/replaymod
+	url = https://github.com/ReplayMod/ReplayMod

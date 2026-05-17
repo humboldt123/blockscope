@@ -1,0 +1,46 @@
+# Gradle
+.gradle/
+build/
+out/
+classes/
+gradle.zip
+gradle-7.5.1/
+
+# Eclipse
+*.launch
+.settings/
+.metadata
+.classpath
+.project
+
+# IntelliJ
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# VS Code
+.vscode/
+
+# Fabric
+run/
+logs/
+
+# Recordings (local dev sessions)
+recordings/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+*.log
+*.swp
+*~
+server.pid
+
+# AI-generated scratch docs
+CHUNK_RENDERING_ANALYSIS.md
+IMPLEMENTATION_SUMMARY.md
+QUICK_REFERENCE.md
+SOLUTION_SUMMARY.md

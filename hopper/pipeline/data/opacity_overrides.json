@@ -1,0 +1,14 @@
+{
+  "_comment": "Manual opacity overrides for the raycaster. Key = block name (without minecraft: prefix). Value = true (opaque, ray terminates) or false (transparent, ray continues). These override the automatic classification from blocks.json `transparent` field.",
+
+  "slime_block":    false,
+  "honey_block":    false,
+  "ice":            false,
+  "frosted_ice":    false,
+  "blue_ice":       false,
+  "packed_ice":     false,
+  "tinted_glass":   false,
+  "end_portal_frame": true,
+
+  "_note": "Leaves are marked transparent=true in minecraft-data so they're auto-classified as non-opaque. Slabs and stairs are transparent=false (solid material) so they're auto-classified as opaque — which is correct since their AABB occludes the ray but the empty space in the cell does not."
+}

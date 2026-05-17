@@ -1,0 +1,7 @@
+numpy>=1.24
+numba>=0.57
+imageio>=2.28
+imageio[pyav]
+Pillow>=9.0
+# taichi>=1.7  # preferred GPU backend; not available on all platforms
+#              # falls back to Numba @njit(parallel=True) automatically

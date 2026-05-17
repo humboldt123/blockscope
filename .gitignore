@@ -1,53 +1,37 @@
-#Blockscope
-visualizer
-dummy
-.claude
-hi
-TODO.md
-ROADMAP.md
-TECHNICAL.md
-gradle.zip
-gradle-7.5.1/
-
-# Gradle
-.gradle/
-build/
-out/
-classes/
-
-# Eclipse
-*.launch
-.settings/
-.metadata
-.classpath
-.project
-
-# IntelliJ
-.idea/
-*.iml
-*.ipr
-*.iws
-
-# VS Code
-.vscode/
-
-# Fabric
-run/
-logs/
-
-# Recordings
-recordings/
-
 # OS
 .DS_Store
 Thumbs.db
 
-# Misc
-*.log
-*.swp
-*~
+# Editors
+.idea/
+*.iml
+.vscode/
+
+# Claude
+.claude/
+
+# Session data (lives externally, never commit)
+BLOCKSCOPE_DATA/
+
+# Leftover root-level Gradle artifacts (mod moved to mods/blockscope/)
+.gradle/
+build/
+run/
+gradle.zip
+gradle-7.5.1/
+
+# Local planning docs
+TODO.md
+ROADMAP.md
+TECHNICAL.md
+
+# AI-generated scratch docs
 CHUNK_RENDERING_ANALYSIS.md
 IMPLEMENTATION_SUMMARY.md
 QUICK_REFERENCE.md
-server.pid
 SOLUTION_SUMMARY.md
+
+# Junk
+dummy/
+hi
+server.pid

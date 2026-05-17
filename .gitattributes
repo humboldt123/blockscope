@@ -1,0 +1,23 @@
+# Shell scripts must use LF or they break on Mac/Linux
+mods/blockscope/gradlew text eol=lf
+server/start.sh text eol=lf
+server/deploy-to-brev.sh text eol=lf
+scripts/*.py text eol=lf
+
+# Windows batch stays CRLF
+mods/blockscope/gradlew.bat text eol=crlf
+
+# Java and other source
+*.java text eol=lf
+*.py text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.gradle text eol=lf
+*.kts text eol=lf
+*.md text eol=lf
+
+# Binaries
+*.jar binary
+*.png binary
+*.mp4 binary
+*.mcpr binary
