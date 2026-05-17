@@ -1,153 +1,105 @@
 #!/usr/bin/env python3
 """
-gen_worldgen_datapack.py — generate a beta-style Minecraft 1.19.4 worldgen datapack.
+gen_worldgen_datapack.py — generate a single beta-style Minecraft 1.19.4 worldgen datapack.
 
-Extracts vanilla 1.19.4 biome/noise/structure JSON from the minecraft jar and
-produces a self-contained datapack with:
-  - Plain oak-tree overworld: plains, forest, river, beach, ocean, desert, swamp
-  - Snowy/taiga/jungle/badlands/mushroom biomes redirected to plain equivalents
-  - No deepslate, no aquifers, no ore veins
-  - Granite/diorite/andesite/copper/tuff ores stripped; classic ores kept
-  - Glow lichen, seagrass, kelp, coral, amethyst, sculk stripped
-  - Oak trees only (birch_and_oak replaced with trees_plains)
-  - Villages: plains only; mineshafts kept; all modern structures disabled
-  - World height y=0 (bedrock) to y=255
+Sources:
+  - minecraft-1.19.4.jar      vanilla biome/noise/structure JSON
+  - OldVillages_1.0.1.zip     classic village structures (old_villages namespace)
+  - Cascades-v1.0-1.19.4.zip  terrain density-function overrides for beta-like terrain
+
+Produces scripts/beta_world.zip with:
+  - Simple oak-tree overworld (plains/forest/river/beach/ocean/desert/swamp)
+  - All modern biomes redirected to plain equivalents
+  - No deepslate, no aquifers, no ore veins, world height y=0..255
+  - Classic ores kept; granite/diorite/andesite/copper/tuff stripped
+  - Oak trees only, small (no fancy oak, no bees)
+  - forest_flowers (lilacs/peonies) stripped; flower_plains → flower_default
+  - Classic mob spawners: horses, donkeys, glow squids, foxes, bees etc. removed
+  - Old-style village structures from OldVillages (terrain_adaptation: none)
+  - Vanilla villages disabled; all modern structures disabled
+  - Cascades terrain density functions (flatter, larger biomes, beta cave shapes)
 
 Usage:
     cd <repo_root>
     python3 scripts/gen_worldgen_datapack.py
 
-Output: scripts/beta_world.zip — drop into <world>/datapacks/ and reload/create world.
+Output: scripts/beta_world.zip — drag into the Data Packs screen when creating a new world.
 """
 
 import copy
 import json
+import os
 import zipfile
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-JAR_PATH  = REPO_ROOT / "visualizer" / ".cache" / "minecraft-1.19.4.jar"
-OUT_ZIP   = Path(__file__).resolve().parent / "beta_world.zip"
+REPO_ROOT         = Path(__file__).resolve().parent.parent
+JAR_PATH          = REPO_ROOT / "visualizer" / ".cache" / "minecraft-1.19.4.jar"
+OLD_VILLAGES_ZIP  = Path.home() / "Downloads" / "OldVillages_1.0.1.zip"
+CASCADES_ZIP      = Path.home() / "Downloads" / "Cascades-v1.0-1.19.4.zip"
+OUT_ZIP           = Path(__file__).resolve().parent / "beta_world.zip"
 
 # ---------------------------------------------------------------------------
-# Overworld biomes to redirect: source_biome → target_biome (copy target's JSON)
-# The biome source still generates these areas; we just swap their contents.
+# Biome redirects: source → target (copy target's full cleaned JSON)
 # ---------------------------------------------------------------------------
 BIOME_REDIRECTS = {
-    # Badlands family → desert
-    "badlands":               "desert",
-    "eroded_badlands":        "desert",
-    "wooded_badlands":        "desert",
-    # Jungle family → forest
-    "bamboo_jungle":          "forest",
-    "jungle":                 "forest",
-    "sparse_jungle":          "forest",
-    # Birch / dark / conifer family → forest
-    "birch_forest":           "forest",
-    "old_growth_birch_forest":"forest",
-    "flower_forest":          "forest",
-    "dark_forest":            "forest",
-    "grove":                  "forest",
-    "old_growth_pine_taiga":  "forest",
-    "old_growth_spruce_taiga":"forest",
-    "taiga":                  "forest",
-    "snowy_taiga":            "forest",
-    # Snowy / mushroom / savanna / meadow → plains
-    "snowy_plains":           "plains",
-    "ice_spikes":             "plains",
-    "meadow":                 "plains",
-    "sunflower_plains":       "plains",
-    "mushroom_fields":        "plains",
-    "savanna":                "plains",
-    "savanna_plateau":        "plains",
-    "deep_dark":              "plains",
-    # Mountain peaks → windswept_hills
-    "frozen_peaks":           "windswept_hills",
-    "jagged_peaks":           "windswept_hills",
-    "snowy_slopes":           "windswept_hills",
-    "stony_peaks":            "windswept_hills",
-    "windswept_forest":       "windswept_hills",
-    "windswept_gravelly_hills":"windswept_hills",
-    "windswept_savanna":      "windswept_hills",
-    # Rivers / beaches / oceans normalised
-    "frozen_river":           "river",
-    "snowy_beach":            "beach",
-    "stony_shore":            "beach",
-    "cold_ocean":             "ocean",
-    "frozen_ocean":           "ocean",
-    "lukewarm_ocean":         "ocean",
-    "warm_ocean":             "ocean",
-    "deep_cold_ocean":        "deep_ocean",
-    "deep_frozen_ocean":      "deep_ocean",
-    "deep_lukewarm_ocean":    "deep_ocean",
-    # Swamp / mangrove
-    "mangrove_swamp":         "swamp",
-    # Cave biomes (underground only — use surface counterpart for surface features)
-    "dripstone_caves":        "plains",
-    "lush_caves":             "forest",
+    "badlands": "desert", "eroded_badlands": "desert", "wooded_badlands": "desert",
+    "bamboo_jungle": "forest", "jungle": "forest", "sparse_jungle": "forest",
+    "birch_forest": "forest", "old_growth_birch_forest": "forest",
+    "flower_forest": "forest", "dark_forest": "forest", "grove": "forest",
+    "old_growth_pine_taiga": "forest", "old_growth_spruce_taiga": "forest",
+    "taiga": "forest", "snowy_taiga": "forest",
+    "snowy_plains": "plains", "ice_spikes": "plains", "meadow": "plains",
+    "sunflower_plains": "plains", "mushroom_fields": "plains",
+    "savanna": "plains", "savanna_plateau": "plains", "deep_dark": "plains",
+    "frozen_peaks": "windswept_hills", "jagged_peaks": "windswept_hills",
+    "snowy_slopes": "windswept_hills", "stony_peaks": "windswept_hills",
+    "windswept_forest": "windswept_hills", "windswept_gravelly_hills": "windswept_hills",
+    "windswept_savanna": "windswept_hills",
+    "frozen_river": "river",
+    "snowy_beach": "beach", "stony_shore": "beach",
+    "cold_ocean": "ocean", "frozen_ocean": "ocean",
+    "lukewarm_ocean": "ocean", "warm_ocean": "ocean",
+    "deep_cold_ocean": "deep_ocean", "deep_frozen_ocean": "deep_ocean",
+    "deep_lukewarm_ocean": "deep_ocean",
+    "mangrove_swamp": "swamp",
+    "dripstone_caves": "plains", "lush_caves": "forest",
 }
 
-# Features stripped from every biome regardless of phase
+NETHER_END_BIOMES = {
+    "basalt_deltas", "crimson_forest", "nether_wastes", "soul_sand_valley", "warped_forest",
+    "end_barrens", "end_highlands", "end_midlands", "small_end_islands", "the_end", "the_void",
+}
+
+# ---------------------------------------------------------------------------
+# Feature stripping / replacement
+# ---------------------------------------------------------------------------
 STRIP_FEATURES = {
-    # Modern stone variants
-    "minecraft:ore_granite_upper",
-    "minecraft:ore_granite_lower",
-    "minecraft:ore_diorite_upper",
-    "minecraft:ore_diorite_lower",
-    "minecraft:ore_andesite_upper",
-    "minecraft:ore_andesite_lower",
-    "minecraft:ore_tuff",
-    "minecraft:ore_copper",
-    # Modern vegetation
-    "minecraft:glow_lichen",
-    "minecraft:underwater_magma",
-    # Seagrass / kelp / coral
-    "minecraft:seagrass_cold",
-    "minecraft:seagrass_normal",
-    "minecraft:seagrass_warm",
-    "minecraft:seagrass_river",
-    "minecraft:seagrass_swamp",
-    "minecraft:seagrass_deep",
-    "minecraft:seagrass_simple",
-    "minecraft:seagrass_slightly_less_seagrass",
-    "minecraft:seagrass_tall",
-    "minecraft:cold_kelp",
-    "minecraft:kelp_cold",
-    "minecraft:kelp",
+    "minecraft:ore_granite_upper", "minecraft:ore_granite_lower",
+    "minecraft:ore_diorite_upper", "minecraft:ore_diorite_lower",
+    "minecraft:ore_andesite_upper", "minecraft:ore_andesite_lower",
+    "minecraft:ore_tuff", "minecraft:ore_copper",
+    "minecraft:glow_lichen", "minecraft:underwater_magma",
+    "minecraft:seagrass_cold", "minecraft:seagrass_normal", "minecraft:seagrass_warm",
+    "minecraft:seagrass_river", "minecraft:seagrass_swamp", "minecraft:seagrass_deep",
+    "minecraft:seagrass_simple", "minecraft:seagrass_slightly_less_seagrass",
+    "minecraft:seagrass_tall", "minecraft:cold_kelp", "minecraft:kelp_cold", "minecraft:kelp",
     "minecraft:sea_pickle",
-    "minecraft:coral_tree_warm",
-    "minecraft:coral_mushroom_warm",
-    "minecraft:coral_fan_warm",
-    "minecraft:coral_claw_warm",
-    # Amethyst / dripstone / lush cave features
+    "minecraft:coral_tree_warm", "minecraft:coral_mushroom_warm",
+    "minecraft:coral_fan_warm", "minecraft:coral_claw_warm",
     "minecraft:amethyst_geode",
-    "minecraft:pointed_dripstone_ceiling",
-    "minecraft:pointed_dripstone_floor",
-    "minecraft:dripstone_clump",
-    "minecraft:large_dripstone",
-    "minecraft:small_dripstone",
-    "minecraft:cave_vine",
-    "minecraft:cave_vine_in_cave",
-    "minecraft:spore_blossom",
-    "minecraft:moss_patch",
-    "minecraft:moss_patch_ceiling",
-    # Sculk
-    "minecraft:sculk_vein",
-    "minecraft:sculk_patch_deep_dark",
-    "minecraft:sculk_patch_ancient_city",
-    "minecraft:sculk_patch",
-    # Nether-like
-    "minecraft:patch_fire",
-    "minecraft:patch_soul_fire",
-    # Bamboo
-    "minecraft:bamboo_light",
-    "minecraft:bamboo",
+    "minecraft:pointed_dripstone_ceiling", "minecraft:pointed_dripstone_floor",
+    "minecraft:dripstone_clump", "minecraft:large_dripstone", "minecraft:small_dripstone",
+    "minecraft:cave_vine", "minecraft:cave_vine_in_cave",
+    "minecraft:spore_blossom", "minecraft:moss_patch", "minecraft:moss_patch_ceiling",
+    "minecraft:sculk_vein", "minecraft:sculk_patch_deep_dark",
+    "minecraft:sculk_patch_ancient_city", "minecraft:sculk_patch",
+    "minecraft:patch_fire", "minecraft:patch_soul_fire",
+    "minecraft:bamboo_light", "minecraft:bamboo",
+    "minecraft:forest_flowers",       # lilac, peony, rose bush, lily of the valley
 }
 
-# Phases emptied entirely for all biomes
-EMPTY_PHASES = {2, 10}  # 2=amethyst_geode  10=freeze_top_layer
+EMPTY_PHASES = {2, 10}  # amethyst_geode, freeze_top_layer
 
-# Tree feature replacements (None = drop entirely)
 TREE_REPLACEMENTS = {
     "minecraft:trees_birch_and_oak":          "minecraft:trees_plains",
     "minecraft:trees_birch":                  "minecraft:trees_plains",
@@ -161,41 +113,57 @@ TREE_REPLACEMENTS = {
     "minecraft:trees_jungle":                 "minecraft:trees_plains",
     "minecraft:trees_sparse_jungle":          "minecraft:trees_plains",
     "minecraft:trees_bamboo_jungle":          "minecraft:trees_plains",
-    "minecraft:trees_snowy":                  None,   # snowy biomes → plains, no trees needed
+    "minecraft:trees_snowy":                  None,
 }
 
-# Structure sets to disable (empty structures list)
+FEATURE_REPLACEMENTS = {
+    "minecraft:flower_plains": "minecraft:flower_default",
+}
+
+# ---------------------------------------------------------------------------
+# Mob spawner stripping
+# ---------------------------------------------------------------------------
+STRIP_SPAWNERS = {
+    "minecraft:horse", "minecraft:donkey", "minecraft:mule",
+    "minecraft:goat", "minecraft:fox", "minecraft:panda", "minecraft:parrot",
+    "minecraft:polar_bear", "minecraft:llama", "minecraft:trader_llama",
+    "minecraft:bee", "minecraft:cat", "minecraft:frog", "minecraft:tadpole",
+    "minecraft:allay", "minecraft:sniffer", "minecraft:camel", "minecraft:armadillo",
+    "minecraft:glow_squid", "minecraft:axolotl",
+    "minecraft:tropical_fish", "minecraft:pufferfish", "minecraft:cod",
+    "minecraft:salmon", "minecraft:dolphin", "minecraft:turtle",
+    "minecraft:pillager", "minecraft:ravager", "minecraft:evoker",
+    "minecraft:vindicator", "minecraft:vex", "minecraft:illusioner",
+    "minecraft:warden", "minecraft:phantom", "minecraft:wandering_trader",
+}
+
+# ---------------------------------------------------------------------------
+# Structure sets to fully disable
+# ---------------------------------------------------------------------------
 DISABLE_STRUCTURE_SETS = {
-    "ancient_cities",
-    "buried_treasures",
-    "desert_pyramids",
-    "end_cities",
-    "igloos",
-    "jungle_temples",
-    "nether_complexes",
-    "nether_fossils",
-    "ocean_monuments",
-    "ocean_ruins",
-    "pillager_outposts",
-    "ruined_portals",
-    "shipwrecks",
-    "strongholds",
-    "swamp_huts",
-    "woodland_mansions",
+    "ancient_cities", "buried_treasures", "desert_pyramids", "end_cities",
+    "igloos", "jungle_temples", "nether_complexes", "nether_fossils",
+    "ocean_monuments", "ocean_ruins", "pillager_outposts", "ruined_portals",
+    "shipwrecks", "strongholds", "swamp_huts", "woodland_mansions",
+    "villages",  # replaced by old_villages namespace
 }
 
-# ---------------------------------------------------------------------------
-# Overworld biome names (skip nether/end when iterating)
-# ---------------------------------------------------------------------------
-NETHER_END_BIOMES = {
-    "basalt_deltas", "crimson_forest", "nether_wastes", "soul_sand_valley", "warped_forest",
-    "end_barrens", "end_highlands", "end_midlands", "small_end_islands", "the_end", "the_void",
-}
+# Cascades density function paths to include (mc namespace overrides + hybrid_beta deps)
+# Excludes overworld_amplified and overworld_large_biomes — not needed for standard worlds
+CASCADES_DF_PREFIXES = (
+    "data/minecraft/worldgen/density_function/overworld/",
+    "data/minecraft/worldgen/density_function/overworld_amplified/",   # needed for sloped_cheese chain
+    "data/hybrid_beta/worldgen/density_function/",                     # dependency of sloped_cheese
+)
 
+
+# ---------------------------------------------------------------------------
+# Biome cleaning
+# ---------------------------------------------------------------------------
 
 def clean_biome(biome: dict) -> dict:
-    """Strip/replace features in a biome JSON in-place copy."""
     b = copy.deepcopy(biome)
+
     features = b.get("features", [])
     new_features = []
     for i, phase in enumerate(features):
@@ -203,57 +171,95 @@ def clean_biome(biome: dict) -> dict:
             new_features.append([])
             continue
         new_phase = []
+        seen = set()
         for feat in phase:
             if feat in STRIP_FEATURES:
                 continue
             if feat in TREE_REPLACEMENTS:
                 replacement = TREE_REPLACEMENTS[feat]
-                if replacement is not None:
-                    new_phase.append(replacement)
+                if replacement is None:
+                    continue
+            elif feat in FEATURE_REPLACEMENTS:
+                replacement = FEATURE_REPLACEMENTS[feat]
             else:
-                new_phase.append(feat)
+                replacement = feat
+            if replacement not in seen:
+                new_phase.append(replacement)
+                seen.add(replacement)
         new_features.append(new_phase)
     b["features"] = new_features
+
+    spawners = b.get("spawners", {})
+    for cat in list(spawners.keys()):
+        spawners[cat] = [e for e in spawners[cat] if e.get("type") not in STRIP_SPAWNERS]
+    b["spawners"] = spawners
+
     return b
 
 
-def make_noise_settings(vanilla: dict) -> dict:
-    """No aquifers, no ore veins, no deepslate, classic y=0..255 world height."""
+# ---------------------------------------------------------------------------
+# Noise settings
+# ---------------------------------------------------------------------------
+
+def make_noise_settings(vanilla: dict, cascades_ns: dict) -> dict:
     ns = copy.deepcopy(vanilla)
     ns["aquifers_enabled"]  = False
     ns["ore_veins_enabled"] = False
-
-    # Classic world height: bedrock at y=0, max y=255
-    ns["noise"]["min_y"]  = 0
-    ns["noise"]["height"] = 256
-
-    # Surface rule: drop entry [2] which is the deepslate vertical_gradient
+    ns["noise"]["min_y"]    = 0
+    ns["noise"]["height"]   = 256
     sr = ns["surface_rule"]
     if sr.get("type") == "minecraft:sequence":
-        sr["sequence"] = sr["sequence"][:2]  # keep [0]=bedrock floor, [1]=surface layers
-
+        sr["sequence"] = sr["sequence"][:2]
+    # Use Cascades' noise_router: gives beta-like terrain shape AND beta-style caves
+    # (the router references hybrid_beta: DFs which we bundle alongside)
+    ns["noise_router"] = copy.deepcopy(cascades_ns["noise_router"])
     return ns
 
 
-def disable_structure_set(vanilla: dict) -> dict:
-    """Return a copy with an empty structures list so nothing spawns."""
+# ---------------------------------------------------------------------------
+# Structure set helpers
+# ---------------------------------------------------------------------------
+
+def disable_ss(vanilla: dict) -> dict:
     ss = copy.deepcopy(vanilla)
     ss["structures"] = []
     return ss
 
 
-def villages_plains_only(vanilla: dict) -> dict:
-    """Keep only village_plains in the villages structure set."""
-    ss = copy.deepcopy(vanilla)
-    ss["structures"] = [s for s in ss["structures"] if s["structure"] == "minecraft:village_plains"]
-    return ss
-
-
 def mineshafts_no_mesa(vanilla: dict) -> dict:
-    """Remove mineshaft_mesa (mesa = badlands = modern feel) from mineshafts."""
     ss = copy.deepcopy(vanilla)
     ss["structures"] = [s for s in ss["structures"] if s["structure"] != "minecraft:mineshaft_mesa"]
     return ss
+
+
+# ---------------------------------------------------------------------------
+# Small-oak configured_feature (no fancy oak, no bees)
+# ---------------------------------------------------------------------------
+
+SMALL_OAK_CF = {
+    "type": "minecraft:tree",
+    "config": {
+        "decorators": [],
+        "dirt_provider": {"type": "minecraft:simple_state_provider",
+                          "state": {"Name": "minecraft:dirt"}},
+        "foliage_placer": {"type": "minecraft:blob_foliage_placer",
+                           "height": 3, "offset": 0, "radius": 2},
+        "foliage_provider": {"type": "minecraft:simple_state_provider", "state": {
+            "Name": "minecraft:oak_leaves",
+            "Properties": {"distance": "7", "persistent": "false", "waterlogged": "false"},
+        }},
+        "force_dirt": False,
+        "ignore_vines": True,
+        "minimum_size": {"type": "minecraft:two_layers_feature_size",
+                         "limit": 1, "lower_size": 0, "upper_size": 1},
+        "trunk_placer": {"type": "minecraft:straight_trunk_placer",
+                         "base_height": 4, "height_rand_a": 2, "height_rand_b": 0},
+        "trunk_provider": {"type": "minecraft:simple_state_provider", "state": {
+            "Name": "minecraft:oak_log",
+            "Properties": {"axis": "y"},
+        }},
+    },
+}
 
 
 # ---------------------------------------------------------------------------
@@ -261,105 +267,105 @@ def mineshafts_no_mesa(vanilla: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def main():
-    if not JAR_PATH.exists():
-        raise FileNotFoundError(f"Minecraft jar not found at {JAR_PATH}")
+    for p, label in [(JAR_PATH, "MC jar"), (OLD_VILLAGES_ZIP, "OldVillages zip"),
+                     (CASCADES_ZIP, "Cascades zip")]:
+        if not p.exists():
+            raise FileNotFoundError(f"{label} not found at {p}")
 
-    print(f"Reading vanilla data from {JAR_PATH}")
+    print(f"Reading vanilla data from {JAR_PATH.name}")
+    with zipfile.ZipFile(CASCADES_ZIP) as zca:
+        cascades_noise = json.loads(zca.read("data/minecraft/worldgen/noise_settings/overworld.json"))
 
     with zipfile.ZipFile(JAR_PATH) as jar:
-        # --- load all overworld biomes ---
-        biome_files = [
-            n for n in jar.namelist()
-            if n.startswith("data/minecraft/worldgen/biome/") and n.endswith(".json")
-        ]
-        vanilla_biomes = {}
-        for path in biome_files:
-            name = path.split("/")[-1].replace(".json", "")
-            vanilla_biomes[name] = json.loads(jar.read(path))
-
-        # --- load noise settings ---
+        vanilla_biomes = {
+            p.split("/")[-1].replace(".json", ""): json.loads(jar.read(p))
+            for p in jar.namelist()
+            if p.startswith("data/minecraft/worldgen/biome/") and p.endswith(".json")
+        }
         vanilla_noise = json.loads(jar.read("data/minecraft/worldgen/noise_settings/overworld.json"))
+        vanilla_ss = {
+            p.split("/")[-1].replace(".json", ""): json.loads(jar.read(p))
+            for p in jar.namelist()
+            if p.startswith("data/minecraft/worldgen/structure_set/") and p.endswith(".json")
+        }
 
-        # --- load structure sets ---
-        ss_files = [
-            n for n in jar.namelist()
-            if n.startswith("data/minecraft/worldgen/structure_set/") and n.endswith(".json")
-        ]
-        vanilla_ss = {}
-        for path in ss_files:
-            name = path.split("/")[-1].replace(".json", "")
-            vanilla_ss[name] = json.loads(jar.read(path))
-
-    # --- resolve redirects: build a map biome_name → clean JSON ---
-    # First, clean all "target" biomes that are kept as-is
-    kept_biomes = set(vanilla_biomes.keys()) - set(BIOME_REDIRECTS.keys()) - NETHER_END_BIOMES
-    cleaned: dict[str, dict] = {}
-    for name in kept_biomes:
-        cleaned[name] = clean_biome(vanilla_biomes[name])
-
-    # Then, resolve redirects (copy cleaned target)
+    # --- clean biomes ---
+    kept = set(vanilla_biomes) - set(BIOME_REDIRECTS) - NETHER_END_BIOMES
+    cleaned: dict[str, dict] = {name: clean_biome(vanilla_biomes[name]) for name in kept}
     for src, tgt in BIOME_REDIRECTS.items():
         if src in NETHER_END_BIOMES:
             continue
-        if tgt not in cleaned:
-            # Target itself might not be in cleaned yet (e.g. deep_ocean)
-            if tgt in vanilla_biomes:
-                cleaned[tgt] = clean_biome(vanilla_biomes[tgt])
-            else:
-                print(f"  WARNING: redirect target '{tgt}' not in jar, skipping {src}")
-                continue
-        cleaned[src] = copy.deepcopy(cleaned[tgt])
+        if tgt not in cleaned and tgt in vanilla_biomes:
+            cleaned[tgt] = clean_biome(vanilla_biomes[tgt])
+        if tgt in cleaned:
+            cleaned[src] = copy.deepcopy(cleaned[tgt])
 
-    # --- build structure set overrides ---
-    out_ss: dict[str, dict] = {}
+    # --- structure sets ---
+    out_ss = {}
     for name, data in vanilla_ss.items():
         if name in DISABLE_STRUCTURE_SETS:
-            out_ss[name] = disable_structure_set(data)
-        elif name == "villages":
-            out_ss[name] = villages_plains_only(data)
+            out_ss[name] = disable_ss(data)
         elif name == "mineshafts":
             out_ss[name] = mineshafts_no_mesa(data)
         else:
             out_ss[name] = copy.deepcopy(data)
 
-    # --- build noise settings ---
-    out_noise = make_noise_settings(vanilla_noise)
-
-    # --- write zip ---
-    print(f"Writing datapack to {OUT_ZIP}")
+    print(f"Writing datapack to {OUT_ZIP.name}")
     with zipfile.ZipFile(OUT_ZIP, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+
         # pack.mcmeta
-        pack_meta = {
+        zout.writestr("pack.mcmeta", json.dumps({
             "pack": {
                 "pack_format": 12,
-                "description": "Beta-style worldgen: plains/forest/ocean/desert/swamp, oak trees, no deepslate, no modern blocks"
+                "description": "Beta-style worldgen: plain oak world, classic terrain, old villages",
             }
-        }
-        zout.writestr("pack.mcmeta", json.dumps(pack_meta, indent=2))
+        }, indent=2))
 
         # biomes
         for name, data in cleaned.items():
-            zout.writestr(
-                f"data/minecraft/worldgen/biome/{name}.json",
-                json.dumps(data, indent=2),
-            )
+            zout.writestr(f"data/minecraft/worldgen/biome/{name}.json",
+                          json.dumps(data, indent=2))
 
-        # noise settings
-        zout.writestr(
-            "data/minecraft/worldgen/noise_settings/overworld.json",
-            json.dumps(out_noise, indent=2),
-        )
+        # noise settings (our tweaks + Cascades noise_router for beta terrain+caves)
+        zout.writestr("data/minecraft/worldgen/noise_settings/overworld.json",
+                      json.dumps(make_noise_settings(vanilla_noise, cascades_noise), indent=2))
 
         # structure sets
         for name, data in out_ss.items():
-            zout.writestr(
-                f"data/minecraft/worldgen/structure_set/{name}.json",
-                json.dumps(data, indent=2),
-            )
+            zout.writestr(f"data/minecraft/worldgen/structure_set/{name}.json",
+                          json.dumps(data, indent=2))
 
-    print(f"Done. Drop {OUT_ZIP.name} into <world>/datapacks/ and create a new world.")
-    print(f"  Biomes written : {len(cleaned)}")
-    print(f"  Structure sets : {len(out_ss)}  ({len(DISABLE_STRUCTURE_SETS)} disabled)")
+        # trees_plains configured_feature override (small oak, no bees, no fancy)
+        zout.writestr("data/minecraft/worldgen/configured_feature/trees_plains.json",
+                      json.dumps(SMALL_OAK_CF, indent=2))
+
+        # --- OldVillages: copy everything from old_villages namespace ---
+        print(f"  Merging {OLD_VILLAGES_ZIP.name}")
+        ov_count = 0
+        with zipfile.ZipFile(OLD_VILLAGES_ZIP) as zov:
+            for item in zov.infolist():
+                if item.filename.startswith("data/old_villages/") and not item.filename.endswith("/"):
+                    zout.writestr(item.filename, zov.read(item.filename))
+                    ov_count += 1
+        print(f"  OldVillages files merged: {ov_count}")
+
+        # --- Cascades: copy terrain density function overrides ---
+        print(f"  Merging {CASCADES_ZIP.name} density functions")
+        df_count = 0
+        with zipfile.ZipFile(CASCADES_ZIP) as zca:
+            for item in zca.infolist():
+                if item.filename.endswith("/"):
+                    continue
+                if any(item.filename.startswith(pfx) for pfx in CASCADES_DF_PREFIXES):
+                    zout.writestr(item.filename, zca.read(item.filename))
+                    df_count += 1
+        print(f"  Cascades density functions merged: {df_count}")
+
+    print(f"\nDone → {OUT_ZIP}")
+    print(f"  Biomes          : {len(cleaned)}")
+    print(f"  Structure sets  : {len(out_ss)}  ({len(DISABLE_STRUCTURE_SETS)} disabled)")
+    print(f"  OldVillages files: {ov_count}")
+    print(f"  Cascades DFs    : {df_count}")
 
 
 if __name__ == "__main__":
