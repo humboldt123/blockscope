@@ -85,7 +85,32 @@ public class SessionManager implements Listener {
 
     public void startWorldPool() {
         plugin.getServer().getMessenger().registerOutgoingPluginChannel(plugin, SESSION_CHANNEL);
+        ensureDatapackInMainWorld();
         refillPool();
+    }
+
+    /**
+     * Paper uses the main world's datapack repository for all programmatically-created worlds.
+     * The per-world datapacks/ folders of custom WorldCreator worlds are NOT read.
+     * So we copy beta_world.zip into world/datapacks/ — if it isn't there already this
+     * server run started without it and we log a warning (restart required to take effect).
+     */
+    private void ensureDatapackInMainWorld() {
+        if (betaDatapackZip == null) return;
+        World mainWorld = Bukkit.getWorlds().get(0);
+        File mainDatapacks = new File(mainWorld.getWorldFolder(), "datapacks");
+        mainDatapacks.mkdirs();
+        File dest = new File(mainDatapacks, "beta_world.zip");
+        if (!dest.exists()) {
+            try {
+                Files.copy(betaDatapackZip.toPath(), dest.toPath());
+                plugin.getLogger().warning("beta_world.zip copied to world/datapacks/ — RESTART server for it to take effect!");
+            } catch (IOException e) {
+                plugin.getLogger().severe("Failed to copy beta datapack to main world: " + e.getMessage());
+            }
+        } else {
+            plugin.getLogger().info("Beta datapack confirmed in world/datapacks/ — active.");
+        }
     }
 
     private void refillPool() {
@@ -103,12 +128,6 @@ public class SessionManager implements Listener {
     private World generateWorld() {
         String name = "bs_" + worldCounter.incrementAndGet() + "_" + Long.toHexString(rng.nextLong() & 0xFFFFFFL);
         long seed = rng.nextLong();
-
-        // Inject beta datapack into the world folder before WorldCreator runs.
-        // Paper reads datapacks from <worldName>/datapacks/ at world load time.
-        if (betaDatapackZip != null) {
-            injectDatapack(name);
-        }
 
         WorldCreator creator = new WorldCreator(name)
             .environment(World.Environment.NORMAL)
@@ -146,21 +165,6 @@ public class SessionManager implements Listener {
         } catch (Exception e) {
             plugin.getLogger().warning("World generation timed out: " + e.getMessage());
             return null;
-        }
-    }
-
-    /** Copy beta_world.zip into <worldName>/datapacks/ before Paper loads the world. */
-    private void injectDatapack(String worldName) {
-        try {
-            File worldDir = new File(Bukkit.getWorldContainer(), worldName);
-            File datapackDir = new File(worldDir, "datapacks");
-            datapackDir.mkdirs();
-            File dest = new File(datapackDir, "beta_world.zip");
-            if (!dest.exists()) {
-                Files.copy(betaDatapackZip.toPath(), dest.toPath(), StandardCopyOption.REPLACE_EXISTING);
-            }
-        } catch (IOException e) {
-            plugin.getLogger().warning("Failed to inject beta datapack into " + worldName + ": " + e.getMessage());
         }
     }
 
