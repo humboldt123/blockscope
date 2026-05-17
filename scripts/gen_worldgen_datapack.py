@@ -36,7 +36,12 @@ REPO_ROOT        = Path(__file__).resolve().parent.parent
 JAR_PATH         = REPO_ROOT / "visualizer" / ".cache" / "minecraft-1.19.4.jar"
 OLD_VILLAGES_ZIP = Path.home() / "Downloads" / "OldVillages_1.0.1.zip"
 CASCADES_ZIP     = Path.home() / "Downloads" / "Cascades-v1.0-1.19.4.zip"
+STRUCTURES_DIR   = Path(__file__).resolve().parent / "structures"   # custom NBT files
 OUT_ZIP          = Path(__file__).resolve().parent / "beta_world.zip"
+
+# Village placement (old_villages namespace): lower spacing = more frequent
+VILLAGE_SPACING    = 18   # avg chunk distance between villages (vanilla=34, was 32)
+VILLAGE_SEPARATION = 5    # minimum chunk distance between villages
 
 # ---------------------------------------------------------------------------
 # Biome redirects applied to both biome JSON content AND the biome source
@@ -299,6 +304,83 @@ def disable_ss(vanilla: dict) -> dict:
     return ss
 
 
+# ---------------------------------------------------------------------------
+# Custom ruins from STRUCTURES_DIR/*.nbt
+# ---------------------------------------------------------------------------
+
+def make_ruins_files(nbt_dir: Path) -> dict[str, object]:
+    """
+    For every *.nbt in nbt_dir, build the necessary worldgen JSON so they
+    scatter randomly across the world as ruins.
+    Returns a dict of zip_path → bytes/str to write into the output zip.
+    """
+    nbt_files = sorted(nbt_dir.glob("*.nbt"))
+    if not nbt_files:
+        return {}
+
+    names = [f.stem for f in nbt_files]   # e.g. ["brickwall", "herobrine", ...]
+    out: dict[str, object] = {}
+
+    # NBT files under beta_world namespace
+    for f in nbt_files:
+        out[f"data/beta_world/structures/{f.name}"] = f.read_bytes()
+
+    # Template pool: randomly picks one ruin piece
+    out["data/beta_world/worldgen/template_pool/ruins.json"] = json.dumps({
+        "name": "beta_world:ruins",
+        "fallback": "minecraft:empty",
+        "elements": [
+            {
+                "weight": 1,
+                "element": {
+                    "element_type": "minecraft:single_pool_element",
+                    "location": f"beta_world:{name}",
+                    "projection": "rigid",
+                    "processors": {"processors": []},
+                },
+            }
+            for name in names
+        ],
+    }, indent=2)
+
+    # Structure definition
+    out["data/beta_world/worldgen/structure/ruin.json"] = json.dumps({
+        "type": "minecraft:jigsaw",
+        "biomes": "#beta_world:has_structure/ruin",
+        "max_distance_from_center": 80,
+        "project_start_to_heightmap": "WORLD_SURFACE_WG",
+        "size": 1,
+        "spawn_overrides": {},
+        "start_height": {"absolute": 0},
+        "start_pool": "beta_world:ruins",
+        "step": "surface_structures",
+        "terrain_adaptation": "none",
+        "use_expansion_hack": False,
+    }, indent=2)
+
+    # Biome tag: spawn ruins in all main overworld biomes
+    out["data/beta_world/tags/worldgen/biome/has_structure/ruin.json"] = json.dumps({
+        "values": [
+            "minecraft:plains", "minecraft:forest",
+            "minecraft:desert", "minecraft:swamp",
+            "minecraft:windswept_hills", "minecraft:beach",
+        ]
+    }, indent=2)
+
+    # Structure set: scattered every ~20 chunks
+    out["data/beta_world/worldgen/structure_set/ruins.json"] = json.dumps({
+        "structures": [{"structure": "beta_world:ruin", "weight": 1}],
+        "placement": {
+            "type": "minecraft:random_spread",
+            "salt": 13371337,
+            "separation": 6,
+            "spacing": 20,
+        },
+    }, indent=2)
+
+    return out
+
+
 def mineshafts_no_mesa(vanilla: dict) -> dict:
     ss = copy.deepcopy(vanilla)
     ss["structures"] = [s for s in ss["structures"] if s["structure"] != "minecraft:mineshaft_mesa"]
@@ -392,15 +474,32 @@ def main():
             zout.writestr(f"data/minecraft/worldgen/configured_feature/{cf_name}.json",
                           json.dumps(SMALL_OAK_CF, indent=2))
 
-        # OldVillages
+        # OldVillages — with tuned village frequency
         print(f"  Merging {OLD_VILLAGES_ZIP.name}")
         ov_count = 0
         with zipfile.ZipFile(OLD_VILLAGES_ZIP) as zov:
             for item in zov.infolist():
-                if item.filename.startswith("data/old_villages/") and not item.filename.endswith("/"):
-                    zout.writestr(item.filename, zov.read(item.filename))
-                    ov_count += 1
+                if item.filename.endswith("/") or not item.filename.startswith("data/old_villages/"):
+                    continue
+                data = zov.read(item.filename)
+                if item.filename == "data/old_villages/worldgen/structure_set/village_plains.json":
+                    ss = json.loads(data)
+                    ss["placement"]["spacing"]    = VILLAGE_SPACING
+                    ss["placement"]["separation"] = VILLAGE_SEPARATION
+                    data = json.dumps(ss, indent=2).encode()
+                    print(f"    village spacing={VILLAGE_SPACING} separation={VILLAGE_SEPARATION}")
+                zout.writestr(item.filename, data)
+                ov_count += 1
         print(f"  OldVillages files merged: {ov_count}")
+
+        # Custom ruins
+        ruins = make_ruins_files(STRUCTURES_DIR)
+        for path, content in ruins.items():
+            if isinstance(content, bytes):
+                zout.writestr(path, content)
+            else:
+                zout.writestr(path, content.encode() if isinstance(content, str) else content)
+        print(f"  Custom ruins: {len([p for p in ruins if p.endswith('.nbt')])} structures")
 
         # Cascades density functions + noise parameters
         print(f"  Merging {CASCADES_ZIP.name} terrain data")
@@ -420,6 +519,7 @@ def main():
     print(f"  OldVillages files : {ov_count}")
     print(f"  Cascades files    : {cascades_count}")
     print(f"  Unique biomes in source: {len(unique_biomes)}")
+    print(f"  Custom ruins: {len(list(STRUCTURES_DIR.glob('*.nbt')))} structures")
 
 
 if __name__ == "__main__":
