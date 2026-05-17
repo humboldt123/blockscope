@@ -1,8 +1,5 @@
 package com.blockscope.lodestone;
 
-import com.github.retrooper.packetevents.PacketEvents;
-import com.github.retrooper.packetevents.api.PacketEventsAPI;
-import io.github.retrooper.packetevents.factory.spigot.SpigotPacketEventsBuilder;
 import org.bukkit.plugin.java.JavaPlugin;
 
 public class LodestonePlugin extends JavaPlugin {
@@ -12,32 +9,23 @@ public class LodestonePlugin extends JavaPlugin {
     private ConnectionGuard connectionGuard;
 
     @Override
-    public void onLoad() {
-        PacketEvents.setAPI(SpigotPacketEventsBuilder.build(this));
-        PacketEvents.getAPI().load();
-    }
-
-    @Override
     public void onEnable() {
         instance = this;
         saveDefaultConfig();
 
         sessionManager  = new SessionManager(this);
-        connectionGuard = new ConnectionGuard(this, sessionManager);
+        connectionGuard = new ConnectionGuard(this);
 
-        PacketEvents.getAPI().getEventManager().registerListeners(connectionGuard);
-        PacketEvents.getAPI().init();
-
+        getServer().getPluginManager().registerEvents(connectionGuard, this);
         getServer().getPluginManager().registerEvents(sessionManager, this);
 
         sessionManager.startWorldPool();
-        getLogger().info("Lodestone enabled — session manager running.");
+        getLogger().info("Lodestone enabled.");
     }
 
     @Override
     public void onDisable() {
-        sessionManager.shutdown();
-        PacketEvents.getAPI().terminate();
+        if (sessionManager != null) sessionManager.shutdown();
         getLogger().info("Lodestone disabled.");
     }
 

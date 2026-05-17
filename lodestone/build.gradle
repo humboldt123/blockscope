@@ -13,13 +13,11 @@ java {
 repositories {
     mavenCentral()
     maven { url 'https://repo.papermc.io/repository/maven-public/' }
-    maven { url 'https://repo.codemc.io/repository/maven-releases/' } // PacketEvents
 }
 
 dependencies {
     compileOnly 'io.papermc.paper:paper-api:1.19.4-R0.1-SNAPSHOT'
-    compileOnly 'com.github.retrooper:packetevents-spigot:2.3.0'
-    // Multiverse-Core API will be added once we integrate world management
+    // PacketEvents added when we wire up the real connection guard for production
 }
 
 shadowJar {

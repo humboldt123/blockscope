@@ -5,9 +5,10 @@ api-version: 1.19
 description: Blockscope session manager — per-player worlds, connection guard, bot control.
 authors: [blockscope]
 
-depend:
-  - PacketEvents
-
 softdepend: []
 
 commands: {}
+
+# Outgoing plugin message channels
+channels:
+  - blockscope:session_start

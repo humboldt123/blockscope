@@ -9,18 +9,19 @@ import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.inventory.ItemStack;
 
-import java.io.File;
+import java.io.*;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Assigns each joining player a private world and a session mode (CREATIVE or SURVIVAL).
- * Manages a preload pool so world assignment is instant on join.
- * Tears down the world on disconnect.
- * Sends "blockscope:session_start" plugin message to trigger bot + recording on the client.
+ * Assigns each joining player a private world with the beta worldgen datapack.
+ * Maintains a preload pool so the world is ready instantly on join.
+ * On join: teleports player, sets gamemode, gives tools (survival), sends session_start.
+ * On quit/timeout: unloads and deletes the world.
  */
 public class SessionManager implements Listener {
 
@@ -37,9 +38,13 @@ public class SessionManager implements Listener {
     private final boolean survivalEnabled;
     private final boolean baritoneControlEnabled;
 
+    // Path to beta_world.zip — resolved relative to plugin data folder
+    private File betaDatapackZip;
+
     private final Queue<World> worldPool = new ConcurrentLinkedQueue<>();
     private final Map<UUID, World> playerWorlds = new ConcurrentHashMap<>();
     private final Map<UUID, Integer> toolCheckTasks = new ConcurrentHashMap<>();
+    private final Map<UUID, Integer> sessionTimers = new ConcurrentHashMap<>();
 
     private final AtomicInteger worldCounter = new AtomicInteger(0);
     private final Random rng = new Random();
@@ -61,11 +66,25 @@ public class SessionManager implements Listener {
         this.creativeEnabled        = cfg.getBoolean("creative_sessions_enabled", true);
         this.survivalEnabled        = cfg.getBoolean("survival_sessions_enabled", true);
         this.baritoneControlEnabled = cfg.getBoolean("baritone_control_enabled", true);
+
+        // Look for beta_world.zip next to the plugin jar (in plugins/ folder)
+        betaDatapackZip = new File(plugin.getDataFolder().getParentFile(), "beta_world.zip");
+        if (!betaDatapackZip.exists()) {
+            // Also check server root
+            betaDatapackZip = new File(Bukkit.getWorldContainer().getParentFile(), "beta_world.zip");
+        }
+        if (!betaDatapackZip.exists()) {
+            plugin.getLogger().warning("beta_world.zip not found — worlds will generate without beta datapack!");
+            betaDatapackZip = null;
+        } else {
+            plugin.getLogger().info("Beta datapack found: " + betaDatapackZip.getAbsolutePath());
+        }
     }
 
-    // ── World pool ────────────────────────────────────────────────────────────
+    // ── World pool ─────────────────────────────────────────────────────────────
 
     public void startWorldPool() {
+        plugin.getServer().getMessenger().registerOutgoingPluginChannel(plugin, SESSION_CHANNEL);
         refillPool();
     }
 
@@ -73,14 +92,23 @@ public class SessionManager implements Listener {
         bgPool.submit(() -> {
             while (worldPool.size() < poolSize) {
                 World w = generateWorld();
-                if (w != null) worldPool.add(w);
+                if (w != null) {
+                    worldPool.add(w);
+                    plugin.getLogger().info("World pool: ready world added (" + w.getName() + "), pool size=" + worldPool.size());
+                }
             }
         });
     }
 
     private World generateWorld() {
-        String name = "bs_world_" + worldCounter.incrementAndGet();
+        String name = "bs_" + worldCounter.incrementAndGet() + "_" + Long.toHexString(rng.nextLong() & 0xFFFFFFL);
         long seed = rng.nextLong();
+
+        // Inject beta datapack into the world folder before WorldCreator runs.
+        // Paper reads datapacks from <worldName>/datapacks/ at world load time.
+        if (betaDatapackZip != null) {
+            injectDatapack(name);
+        }
 
         WorldCreator creator = new WorldCreator(name)
             .environment(World.Environment.NORMAL)
@@ -89,27 +117,90 @@ public class SessionManager implements Listener {
 
         CompletableFuture<World> future = new CompletableFuture<>();
         Bukkit.getScheduler().runTask(plugin, () -> {
-            World w = creator.createWorld();
-            if (w != null) {
-                w.setDifficulty(Difficulty.PEACEFUL);
-                w.setGameRule(GameRule.DO_MOB_SPAWNING, false);
-                w.setGameRule(GameRule.DO_DAYLIGHT_CYCLE, true);
-                w.setGameRule(GameRule.ANNOUNCE_ADVANCEMENTS, false);
-                w.setGameRule(GameRule.SHOW_DEATH_MESSAGES, false);
-                w.getChunkAt(0, 0).load(true);
+            try {
+                World w = creator.createWorld();
+                if (w != null) {
+                    w.setDifficulty(Difficulty.PEACEFUL);
+                    w.setGameRule(GameRule.DO_MOB_SPAWNING, false);
+                    w.setGameRule(GameRule.DO_DAYLIGHT_CYCLE, true);
+                    w.setGameRule(GameRule.ANNOUNCE_ADVANCEMENTS, false);
+                    w.setGameRule(GameRule.SHOW_DEATH_MESSAGES, false);
+                    w.setGameRule(GameRule.DO_IMMEDIATE_RESPAWN, true);
+                    // Pre-load a small area around spawn
+                    Location spawn = w.getSpawnLocation();
+                    for (int dx = -1; dx <= 1; dx++) for (int dz = -1; dz <= 1; dz++) {
+                        w.getChunkAt(spawn.getBlockX() / 16 + dx, spawn.getBlockZ() / 16 + dz).load(true);
+                    }
+                    // 1/5 chance: relocate spawn to a village; 1/5: other structure; 3/5: leave it
+                    targetSpawn(w);
+                }
+                future.complete(w);
+            } catch (Exception e) {
+                plugin.getLogger().severe("World creation failed: " + e.getMessage());
+                future.complete(null);
             }
-            future.complete(w);
         });
 
         try {
-            return future.get(60, TimeUnit.SECONDS);
+            return future.get(120, TimeUnit.SECONDS);
         } catch (Exception e) {
-            plugin.getLogger().warning("World generation failed: " + e.getMessage());
+            plugin.getLogger().warning("World generation timed out: " + e.getMessage());
             return null;
         }
     }
 
-    // ── Player join / quit ────────────────────────────────────────────────────
+    /** Copy beta_world.zip into <worldName>/datapacks/ before Paper loads the world. */
+    private void injectDatapack(String worldName) {
+        try {
+            File worldDir = new File(Bukkit.getWorldContainer(), worldName);
+            File datapackDir = new File(worldDir, "datapacks");
+            datapackDir.mkdirs();
+            File dest = new File(datapackDir, "beta_world.zip");
+            if (!dest.exists()) {
+                Files.copy(betaDatapackZip.toPath(), dest.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            }
+        } catch (IOException e) {
+            plugin.getLogger().warning("Failed to inject beta datapack into " + worldName + ": " + e.getMessage());
+        }
+    }
+
+    /**
+     * Attempt to bias the spawn point.
+     * 1/5 → village, 1/5 → random interesting structure, 3/5 → leave vanilla spawn.
+     * Uses /locate equivalent via Paper's StructureSearchResult.
+     */
+    private void targetSpawn(World world) {
+        int roll = rng.nextInt(5);
+        if (roll == 0) {
+            locateAndSetSpawn(world, StructureType.VILLAGE);
+        } else if (roll == 1) {
+            StructureType[] candidates = {
+                StructureType.MINESHAFT,
+                StructureType.DESERT_PYRAMID,
+                StructureType.RUINED_PORTAL,
+                StructureType.SWAMP_HUT
+            };
+            locateAndSetSpawn(world, candidates[rng.nextInt(candidates.length)]);
+        }
+        // else: leave spawn where vanilla placed it (3/5 of the time)
+    }
+
+    private void locateAndSetSpawn(World world, StructureType type) {
+        try {
+            Location origin = world.getSpawnLocation();
+            Location found = world.locateNearestStructure(origin, type, 200, false);
+            if (found != null) {
+                found.setY(world.getHighestBlockYAt(found.getBlockX(), found.getBlockZ()) + 1);
+                world.setSpawnLocation(found);
+                plugin.getLogger().info(world.getName() + ": spawn → " + type.getName() +
+                    " @ " + found.getBlockX() + "," + found.getBlockZ());
+            }
+        } catch (Exception e) {
+            // Structure not found nearby — leave spawn as-is
+        }
+    }
+
+    // ── Player join / quit ─────────────────────────────────────────────────────
 
     @EventHandler
     public void onPlayerJoin(PlayerJoinEvent event) {
@@ -122,7 +213,8 @@ public class SessionManager implements Listener {
             world = generateWorldSync();
         }
         if (world == null) {
-            player.kick(net.kyori.adventure.text.Component.text("§cFailed to create session world. Try again."));
+            player.kick(net.kyori.adventure.text.Component.text("§cFailed to create session world. Try again in a moment."));
+            refillPool();
             return;
         }
 
@@ -134,25 +226,32 @@ public class SessionManager implements Listener {
         World finalWorld = world;
 
         Bukkit.getScheduler().runTask(plugin, () -> {
-            player.teleport(finalWorld.getSpawnLocation());
+            // Clear inventory and apply gamemode before teleport
+            player.getInventory().clear();
             player.setGameMode(creative ? GameMode.CREATIVE : GameMode.SURVIVAL);
+            player.teleport(finalWorld.getSpawnLocation());
 
             if (!creative && toolRandomisation) {
                 giveRandomTools(player);
                 scheduleToolCheck(player);
             }
 
-            if (baritoneControlEnabled) {
-                sendSessionStart(player, modeStr);
-            }
+            // Always send session_start so the mod auto-starts recording + bot
+            sendSessionStart(player, modeStr);
 
-            plugin.getLogger().info("Session started: " + player.getName() +
-                " → world=" + finalWorld.getName() + " mode=" + modeStr);
+            plugin.getLogger().info("Session: " + player.getName() +
+                " → " + finalWorld.getName() + " [" + modeStr + "]");
         });
 
-        Bukkit.getScheduler().runTaskLater(plugin,
-            () -> endSession(player, "timeout"),
+        // Session timer — kick after duration so client auto-reconnects
+        int timerId = Bukkit.getScheduler().scheduleSyncDelayedTask(plugin,
+            () -> {
+                if (player.isOnline()) {
+                    endSession(player, "timeout");
+                }
+            },
             (long) sessionDurationSeconds * 20L);
+        sessionTimers.put(player.getUniqueId(), timerId);
     }
 
     @EventHandler
@@ -164,44 +263,50 @@ public class SessionManager implements Listener {
     private void endSession(Player player, String reason) {
         UUID uuid = player.getUniqueId();
         cancelToolCheck(uuid);
+        Integer timerId = sessionTimers.remove(uuid);
+        if (timerId != null) Bukkit.getScheduler().cancelTask(timerId);
 
         World world = playerWorlds.remove(uuid);
         if (world == null) return;
 
-        plugin.getLogger().info("Session ended (" + reason + "): " + player.getName() +
-            " world=" + world.getName());
+        plugin.getLogger().info("Session ended (" + reason + "): " + player.getName() + " / " + world.getName());
 
         if ("timeout".equals(reason) && player.isOnline()) {
             player.kick(net.kyori.adventure.text.Component.text("§aSession complete — reconnecting…"));
         }
 
-        Bukkit.getScheduler().runTaskLater(plugin, () -> unloadAndDeleteWorld(world), 20L);
+        Bukkit.getScheduler().runTaskLater(plugin, () -> unloadAndDeleteWorld(world), 40L);
     }
 
     private void unloadAndDeleteWorld(World world) {
-        world.getPlayers().forEach(p -> p.teleport(Bukkit.getWorlds().get(0).getSpawnLocation()));
+        World fallback = Bukkit.getWorlds().stream()
+            .filter(w -> !w.getName().startsWith("bs_"))
+            .findFirst().orElse(Bukkit.getWorlds().get(0));
+        world.getPlayers().forEach(p -> p.teleport(fallback.getSpawnLocation()));
         Bukkit.unloadWorld(world, false);
         bgPool.submit(() -> deleteDir(world.getWorldFolder()));
     }
 
-    // ── Tool randomisation ────────────────────────────────────────────────────
+    // ── Tool randomisation ─────────────────────────────────────────────────────
 
     private void giveRandomTools(Player player) {
         String tier = TOOL_TIERS[rng.nextInt(TOOL_TIERS.length)];
-        player.getInventory().clear();
         for (String type : TOOL_TYPES) {
             Material mat = Material.matchMaterial("minecraft:" + tier + "_" + type);
             if (mat != null) player.getInventory().addItem(new ItemStack(mat));
         }
         player.getInventory().addItem(new ItemStack(Material.TORCH, 16));
         player.getInventory().addItem(new ItemStack(Material.BREAD, 16));
+        plugin.getLogger().fine("Tools: " + tier + " tier → " + player.getName());
     }
 
     private void scheduleToolCheck(Player player) {
         int taskId = Bukkit.getScheduler().scheduleSyncRepeatingTask(plugin, () -> {
             if (!player.isOnline()) return;
-            ItemStack slot0 = player.getInventory().getItem(0);
-            boolean hasPickaxe = slot0 != null && slot0.getType().name().endsWith("_PICKAXE");
+            boolean hasPickaxe = false;
+            for (ItemStack item : player.getInventory().getContents()) {
+                if (item != null && item.getType().name().endsWith("_PICKAXE")) { hasPickaxe = true; break; }
+            }
             if (!hasPickaxe) giveRandomTools(player);
         }, toolCheckIntervalTicks, toolCheckIntervalTicks);
         toolCheckTasks.put(player.getUniqueId(), taskId);
@@ -212,7 +317,7 @@ public class SessionManager implements Listener {
         if (taskId != null) Bukkit.getScheduler().cancelTask(taskId);
     }
 
-    // ── Session start packet ──────────────────────────────────────────────────
+    // ── Session start packet ───────────────────────────────────────────────────
 
     private void sendSessionStart(Player player, String mode) {
         byte[] modeBytes = mode.getBytes(StandardCharsets.UTF_8);
@@ -223,7 +328,7 @@ public class SessionManager implements Listener {
         player.sendPluginMessage(plugin, SESSION_CHANNEL, buf.array());
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
+    // ── Helpers ────────────────────────────────────────────────────────────────
 
     private boolean assignCreative() {
         if (creativeEnabled && !survivalEnabled) return true;
@@ -236,7 +341,7 @@ public class SessionManager implements Listener {
     private World generateWorldSync() {
         CompletableFuture<World> f = new CompletableFuture<>();
         bgPool.submit(() -> f.complete(generateWorld()));
-        try { return f.get(90, TimeUnit.SECONDS); } catch (Exception e) { return null; }
+        try { return f.get(120, TimeUnit.SECONDS); } catch (Exception e) { return null; }
     }
 
     private void deleteDir(File dir) {
@@ -250,6 +355,7 @@ public class SessionManager implements Listener {
     }
 
     public void shutdown() {
+        plugin.getServer().getMessenger().unregisterOutgoingPluginChannel(plugin, SESSION_CHANNEL);
         bgPool.shutdownNow();
         for (World w : worldPool) unloadAndDeleteWorld(w);
         worldPool.clear();
