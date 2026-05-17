@@ -338,7 +338,11 @@ def patch_structure_nbt(data: bytes) -> bytes:
         "minecraft:lectern":            ("minecraft:air",            {}),
         # Keep orientation; upgrade to classic equivalent
         "minecraft:smoker":             ("minecraft:furnace",        None),
-        "minecraft:spruce_fence_gate":  ("minecraft:oak_fence_gate", None),
+        # Well top was built from fence gates (6×6×6 enclosure) → remove entirely
+        "minecraft:spruce_fence_gate":  ("minecraft:air",            {}),
+        "minecraft:oak_fence_gate":     ("minecraft:air",            {}),
+        # Blacksmith smooth_stone_slab → full stone block
+        "minecraft:smooth_stone_slab":  ("minecraft:stone",          {}),
     }
 
     # OldVillages stores NBTs uncompressed inside the zip; custom ones may be gzipped
