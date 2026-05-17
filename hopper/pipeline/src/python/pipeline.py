@@ -104,12 +104,15 @@ def run_stage2(session_dir: Path, labels_dir: Path):
     # ── Write per-tick npz files ─────────────────────────────────────────────
     log.info("Stage 2: writing per-tick .npz files …")
     for t_idx, tick in enumerate(ticks):
+        # camera is absent on the first few ticks before GameRenderer.getCamera() is ready;
+        # fall back to the player entity position so downstream code always has a valid pose.
+        cam = tick["player"].get("camera") or tick["player"]
         pose = {
-            "x": tick["player"]["camera"]["x"],
-            "y": tick["player"]["camera"]["y"],
-            "z": tick["player"]["camera"]["z"],
-            "yaw":   tick["player"]["camera"]["yaw"],
-            "pitch": tick["player"]["camera"]["pitch"],
+            "x": cam["x"],
+            "y": cam["y"],
+            "z": cam["z"],
+            "yaw":   cam["yaw"],
+            "pitch": cam["pitch"],
             "fov":   tick["player"].get("fov", 70.0),
             "perspective": tick["player"].get("cameraPerspective", "first_person"),
         }

@@ -86,6 +86,9 @@ public class SegmentedTSEncoder {
         this.lastCaptureTime = System.currentTimeMillis();
         this.recording = true;
 
+        // Resolve ffmpeg before touching anything else — fail loud if missing
+        config.ffmpegPath = resolveFfmpeg(config.ffmpegPath);
+
         // Start uploader thread
         uploaderThread = new Thread(this::uploadWorker, "SegmentUploader");
         uploaderThread.setDaemon(true);
@@ -96,6 +99,53 @@ public class SegmentedTSEncoder {
 
         System.out.println("[SegmentedTS] Started: " + config.resolutionWidth + "x" +
             config.resolutionHeight + " @ " + config.targetFps + " FPS, 10-sec segments");
+    }
+
+    /**
+     * Resolves the ffmpeg binary. If the configured value is a bare name ("ffmpeg"),
+     * probes common install locations so it works out-of-the-box on Mac and Linux
+     * without requiring the user to set ffmpeg_path manually.
+     */
+    private static String resolveFfmpeg(String configured) throws IOException {
+        // Absolute path — just verify it exists
+        if (configured.contains("/") || configured.contains("\\")) {
+            if (new java.io.File(configured).canExecute()) return configured;
+            throw new IOException(
+                "ffmpeg not found at '" + configured + "'. " +
+                "Fix ffmpeg_path in blockscope.properties or install ffmpeg.");
+        }
+        // Bare name — probe standard locations before giving up
+        boolean isWindows = System.getProperty("os.name", "").toLowerCase().contains("win");
+        String[] candidates = isWindows ? new String[]{
+            "C:\\ffmpeg\\bin\\ffmpeg.exe",                          // common manual install
+            "C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe",
+            System.getenv("USERPROFILE") + "\\scoop\\shims\\ffmpeg.exe",  // scoop
+            "C:\\ProgramData\\chocolatey\\bin\\ffmpeg.exe",         // chocolatey
+        } : new String[]{
+            "/opt/homebrew/bin/ffmpeg",   // Mac ARM (Apple Silicon)
+            "/usr/local/bin/ffmpeg",       // Mac Intel / Linux manual install
+            "/usr/bin/ffmpeg",             // Linux distro package
+            "/snap/bin/ffmpeg",            // Linux snap
+        };
+        for (String path : candidates) {
+            if (path != null && new java.io.File(path).canExecute()) {
+                System.out.println("[SegmentedTS] ffmpeg resolved to: " + path);
+                return path;
+            }
+        }
+        // Last resort: try running it — works if ffmpeg is anywhere on PATH
+        try {
+            Process p = new ProcessBuilder(configured, "-version").start();
+            p.waitFor();
+            return configured;
+        } catch (Exception e) {
+            String install = isWindows
+                ? "winget install ffmpeg  /  choco install ffmpeg  /  scoop install ffmpeg"
+                : "brew install ffmpeg  /  apt install ffmpeg";
+            throw new IOException(
+                "ffmpeg not found. Install it (" + install + ") " +
+                "or set ffmpeg_path=/full/path/to/ffmpeg in blockscope.properties.");
+        }
     }
 
     private void startNewSegment() throws IOException {
@@ -111,7 +161,7 @@ public class SegmentedTSEncoder {
         // Start ffmpeg for this segment
         // Captures full framebuffer and scales to fixed target resolution (640x360)
         ProcessBuilder pb = new ProcessBuilder(
-            "ffmpeg",
+            config.ffmpegPath,
             "-f", "rawvideo",
             "-pixel_format", "rgb24",
             "-video_size", captureWidth + "x" + captureHeight,

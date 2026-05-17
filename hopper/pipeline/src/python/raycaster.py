@@ -189,7 +189,9 @@ def compute_visibility(
     global _warmed_up
     from io_helpers import camera_vectors, player_screen_bbox
 
-    cam = tick["player"]["camera"]
+    # camera is absent on early ticks before GameRenderer.getCamera() is ready;
+    # fall back to the player entity position so rays still originate somewhere sane.
+    cam = tick["player"].get("camera") or tick["player"]
     fov = tick["player"].get("fov", 70.0)
     perspective = tick["player"].get("cameraPerspective", "first_person")
 

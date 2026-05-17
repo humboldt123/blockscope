@@ -11,7 +11,7 @@
  *
  * Run:
  *   node pipeline/src/js/build_texture_map.js [assets_dir]
- *   assets_dir defaults to C:\Users\venus\OneDrive\Desktop\visualizer\assets\minecraft
+ *   assets_dir defaults to $MC_ASSETS_DIR or <repo_root>/visualizer/assets/minecraft
  */
 
 const fs   = require('fs');
@@ -23,7 +23,8 @@ const BST_PATH      = path.join(PIPELINE_ROOT, 'data', 'blockstate_table_1.19.4.
 const OUT_PATH      = path.join(PIPELINE_ROOT, 'data', 'texture_map_1.19.4.json');
 
 const ASSETS_DIR = process.argv[2] ||
-    'C:\\Users\\venus\\OneDrive\\Desktop\\visualizer\\assets\\minecraft';
+    process.env.MC_ASSETS_DIR ||
+    path.resolve(PIPELINE_ROOT, '..', '..', 'visualizer', 'assets', 'minecraft');
 
 const mcData = require('minecraft-data')(MC_VERSION);
 

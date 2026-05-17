@@ -35,6 +35,7 @@ def main():
     (mc_dir / "config").mkdir(parents=True, exist_ok=True)
 
     files = [
+        ("instance.cfg",            instance_dir / "instance.cfg"),
         ("mmc-pack.json",           instance_dir / "mmc-pack.json"),
         ("options.txt",             mc_dir / "options.txt"),
         ("blockscope.properties",   mc_dir / "blockscope.properties"),

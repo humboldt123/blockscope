@@ -34,7 +34,7 @@ app.add_middleware(
 )
 
 # Base data directory (local for debugging)
-DATA_DIR = Path("C:/Users/venus/OneDrive/Desktop/BLOCKSCOPE_DATA")
+DATA_DIR = Path(os.environ.get("DATA_DIR", Path.home() / "blockscope_data"))
 
 # Create base directory if it doesn't exist
 try:

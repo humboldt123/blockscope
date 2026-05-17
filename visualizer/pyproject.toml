@@ -11,4 +11,7 @@ dependencies = [
     "pyglm>=2.8.3",
     "imgui[pygame]>=2.0.0",
     "av>=16.0.0",
+    "numpy>=2.4.5",
+    "pillow>=12.2.0",
+    "nbtlib>=2.0.4",
 ]

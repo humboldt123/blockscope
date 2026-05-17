@@ -12,6 +12,7 @@ the voxel view for that tick, and puts video frame F on the left.
 
 import json
 import logging
+import os
 import sys
 import time
 from fractions import Fraction
@@ -25,7 +26,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 PIPELINE_ROOT  = Path(__file__).resolve().parent.parent.parent
-DATA_ROOT      = Path(r"C:\Users\venus\OneDrive\Desktop\BLOCKSCOPE_DATA")
+DATA_ROOT      = Path(os.environ.get("DATA_DIR", Path.home() / "blockscope_data"))
 PREFER_SESSION = "session_1777852157"
 
 sys.path.insert(0, str(PIPELINE_ROOT / "src" / "python"))

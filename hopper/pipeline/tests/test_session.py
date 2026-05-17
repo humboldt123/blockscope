@@ -17,6 +17,7 @@ Pass/fail = you look at the renders and decide.
 import json
 import logging
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -30,7 +31,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-DATA_ROOT    = Path(r"C:\Users\venus\OneDrive\Desktop\BLOCKSCOPE_DATA")
+DATA_ROOT    = Path(os.environ.get("DATA_DIR", Path.home() / "blockscope_data"))
 PREFER_SESSION = "session_1777850024"
 
 PIPELINE_ROOT = Path(__file__).resolve().parent.parent

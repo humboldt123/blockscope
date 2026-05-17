@@ -125,8 +125,11 @@ public class RecordingManager {
             System.err.println("[Blockscope] Failed to create session directory: " + e.getMessage());
         }
 
-        // Init session on server
-        serverPost("/init-session?session_id=" + sessionId, null, null);
+        // Init session on server — fail loud if unreachable
+        if (!serverPost("/init-session?session_id=" + sessionId, null, null)) {
+            sendChatMessage("§c[Blockscope] §fCannot reach server at " + config.serverUrl +
+                " — ticks/video won't save!");
+        }
 
         // Start streaming writers for ticks, inputs, frame mapping
         writer.start(sessionId, config.serverUrl);
@@ -136,8 +139,13 @@ public class RecordingManager {
             segmentedEncoder = new SegmentedTSEncoder(config, sessionId, config.serverUrl, sessionDir);
             segmentedEncoder.startRecording();
         } catch (Exception e) {
-            System.err.println("[Blockscope] Failed to start video: " + e.getMessage());
+            String msg = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+            System.err.println("[Blockscope] Failed to start video: " + msg);
             segmentedEncoder = null;
+            // Tell the player immediately — don't let this fail silently
+            final String chatMsg = msg;
+            MinecraftClient.getInstance().execute(() ->
+                sendChatMessage("§c[Blockscope] §fVideo error: " + chatMsg));
         }
 
         // Build and upload metadata
@@ -612,7 +620,7 @@ public class RecordingManager {
         }
     }
 
-    private void serverPost(String path, String contentType, byte[] body) {
+    private boolean serverPost(String path, String contentType, byte[] body) {
         try {
             java.net.HttpURLConnection conn = (java.net.HttpURLConnection)
                     new java.net.URL(config.serverUrl + path).openConnection();
@@ -625,8 +633,10 @@ public class RecordingManager {
             int code = conn.getResponseCode();
             if (code != 200) System.err.println("[Blockscope] Server POST " + path + " returned " + code);
             conn.disconnect();
+            return code == 200;
         } catch (Exception e) {
             System.err.println("[Blockscope] Server POST " + path + " failed: " + e.getMessage());
+            return false;
         }
     }
 }

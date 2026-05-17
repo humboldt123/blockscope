@@ -62,8 +62,12 @@ def beta17_brightness(level: float) -> float:
 # ── Numba BFS kernel ──────────────────────────────────────────────────────────
 
 @njit(cache=True)
-def _bfs_flood_nb(light_map, is_opaque, W):
-    """BFS flood fill in-place. Uses pre-allocated queue arrays."""
+def _bfs_sky_nb(light_map, is_opaque, W):
+    """
+    Sky-light BFS: transparent cells transmit full strength (no decrease),
+    opaque cells block propagation entirely. This matches Minecraft's sky
+    light model where sunlight doesn't attenuate through air.
+    """
     MAXQ = W * W * W * 6
     qx = np.zeros(MAXQ, dtype=np.int32)
     qy = np.zeros(MAXQ, dtype=np.int32)
@@ -71,43 +75,61 @@ def _bfs_flood_nb(light_map, is_opaque, W):
     head = 0
     tail = 0
 
-    # Seed queue with all non-zero cells
     for x in range(W):
         for y in range(W):
             for z in range(W):
                 if light_map[x, y, z] > 0:
-                    qx[tail] = x
-                    qy[tail] = y
-                    qz[tail] = z
-                    tail += 1
+                    qx[tail] = x; qy[tail] = y; qz[tail] = z; tail += 1
+
+    ddx = np.array([1, -1, 0, 0, 0,  0], dtype=np.int32)
+    ddy = np.array([0,  0, 1, -1, 0,  0], dtype=np.int32)
+    ddz = np.array([0,  0, 0,  0, 1, -1], dtype=np.int32)
+
+    while head < tail:
+        cx = qx[head]; cy = qy[head]; cz = qz[head]; head += 1
+        lv = int(light_map[cx, cy, cz])
+        for d in range(6):
+            nx = cx + ddx[d]; ny = cy + ddy[d]; nz = cz + ddz[d]
+            if 0 <= nx < W and 0 <= ny < W and 0 <= nz < W:
+                if not is_opaque[nx, ny, nz] and lv > int(light_map[nx, ny, nz]):
+                    light_map[nx, ny, nz] = np.uint8(lv)
+                    if tail < MAXQ:
+                        qx[tail] = nx; qy[tail] = ny; qz[tail] = nz; tail += 1
+
+
+@njit(cache=True)
+def _bfs_flood_nb(light_map, is_opaque, W):
+    """Block-light BFS: decreases by 1 per step (torch/lava model)."""
+    MAXQ = W * W * W * 6
+    qx = np.zeros(MAXQ, dtype=np.int32)
+    qy = np.zeros(MAXQ, dtype=np.int32)
+    qz = np.zeros(MAXQ, dtype=np.int32)
+    head = 0
+    tail = 0
+
+    for x in range(W):
+        for y in range(W):
+            for z in range(W):
+                if light_map[x, y, z] > 0:
+                    qx[tail] = x; qy[tail] = y; qz[tail] = z; tail += 1
 
     ddx = np.array([1, -1,  0,  0,  0,  0], dtype=np.int32)
     ddy = np.array([0,  0,  1, -1,  0,  0], dtype=np.int32)
     ddz = np.array([0,  0,  0,  0,  1, -1], dtype=np.int32)
 
     while head < tail:
-        cx = qx[head]
-        cy = qy[head]
-        cz = qz[head]
-        head += 1
-
+        cx = qx[head]; cy = qy[head]; cz = qz[head]; head += 1
         lv  = int(light_map[cx, cy, cz])
         nlv = lv - 1
         if nlv <= 0:
             continue
-
         for d in range(6):
-            nx = cx + ddx[d]
-            ny = cy + ddy[d]
-            nz = cz + ddz[d]
+            nx = cx + ddx[d]; ny = cy + ddy[d]; nz = cz + ddz[d]
             if 0 <= nx < W and 0 <= ny < W and 0 <= nz < W:
                 if not is_opaque[nx, ny, nz] and nlv > int(light_map[nx, ny, nz]):
-                    light_map[nx, ny, nz] = nlv
+                    light_map[nx, ny, nz] = np.uint8(nlv)
                     if tail < MAXQ:
-                        qx[tail] = nx
-                        qy[tail] = ny
-                        qz[tail] = nz
-                        tail += 1
+                        qx[tail] = nx; qy[tail] = ny; qz[tail] = nz; tail += 1
 
 
 @njit(cache=True)
@@ -148,10 +170,10 @@ def compute_lightmap(b_arr: np.ndarray) -> np.ndarray:
     b_safe     = np.clip(b_arr.astype(np.int64), 0, len(_OPAQUE_LUT) - 1).astype(np.int32)
     is_opaque  = _OPAQUE_LUT[b_safe]
 
-    # Sky light — seed top layer, then BFS
+    # Sky light — seed top layer, then BFS (full-strength propagation through air)
     sky = np.zeros((W, W, W), dtype=np.uint8)
     sky[:, W - 1, :] = np.where(~is_opaque[:, W - 1, :], np.uint8(15), np.uint8(0))
-    _bfs_flood_nb(sky, is_opaque, W)
+    _bfs_sky_nb(sky, is_opaque, W)
 
     # Block light — seed emitters, then BFS
     emit_safe = np.clip(b_arr.astype(np.int64), 0, len(_EMIT_MAP) - 1).astype(np.int32)

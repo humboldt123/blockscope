@@ -400,7 +400,9 @@ async function main() {
   // We use floor() on the camera position per the spec's window definition.
   for (let i = 0; i < tickCount; i++) {
     const t = ticks[i];
-    const cam = t.player.camera;
+    // camera is absent on early ticks before GameRenderer.getCamera() is ready;
+    // fall back to the player entity position so the window is still centred correctly.
+    const cam = t.player.camera || t.player;
     pxArr[i] = Math.floor(cam.x);
     pyArr[i] = Math.floor(cam.y);
     pzArr[i] = Math.floor(cam.z);

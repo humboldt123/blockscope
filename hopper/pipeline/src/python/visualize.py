@@ -16,6 +16,7 @@ is ~50-200× faster.
 import json
 import logging
 import math
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -162,8 +163,9 @@ _BST_DATA:     Optional[dict] = None
 _TEX_MAP_DATA: Optional[list] = None
 _TEX_CACHE:    dict = {}
 
-_TEX_DIR  = Path(r'C:\Users\venus\OneDrive\Desktop\visualizer\assets\minecraft\textures\block')
-_JAR_PATH = Path(r'C:\Users\venus\OneDrive\Desktop\visualizer\.cache\minecraft-1.19.4.jar')
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent
+_TEX_DIR  = Path(os.environ.get("MC_TEX_DIR",  _REPO_ROOT / "visualizer" / "assets" / "minecraft" / "textures" / "block"))
+_JAR_PATH = Path(os.environ.get("MC_JAR_PATH", _REPO_ROOT / "visualizer" / ".cache" / "minecraft-1.19.4.jar"))
 
 _GRASS_TINT:   Optional[np.ndarray] = None
 _FOLIAGE_TINT: Optional[np.ndarray] = None
