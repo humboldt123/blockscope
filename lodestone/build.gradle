@@ -1,0 +1,38 @@
+plugins {
+    id 'java'
+    id 'com.github.johnrengelman.shadow' version '8.1.1'
+}
+
+group = 'com.blockscope'
+version = '1.0.0'
+
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(17)
+}
+
+repositories {
+    mavenCentral()
+    maven { url 'https://repo.papermc.io/repository/maven-public/' }
+    maven { url 'https://repo.codemc.io/repository/maven-releases/' } // PacketEvents
+}
+
+dependencies {
+    compileOnly 'io.papermc.paper:paper-api:1.19.4-R0.1-SNAPSHOT'
+    compileOnly 'com.github.retrooper:packetevents-spigot:2.3.0'
+    // Multiverse-Core API will be added once we integrate world management
+}
+
+shadowJar {
+    archiveClassifier = ''
+    // Nothing to shade yet — PacketEvents is compileOnly (plugin dep at runtime)
+}
+
+jar {
+    manifest {
+        attributes 'Main-Class': 'com.blockscope.lodestone.LodestonePlugin'
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}

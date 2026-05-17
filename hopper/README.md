@@ -1,4 +1,4 @@
-# blockscope-server
+# hopper
 
 FastAPI server that receives recording session uploads from N Blockscope mod users and stores them for processing.
 
@@ -15,10 +15,10 @@ pip install -r requirements.txt
 
 ```bash
 # From local machine — copy to Brev instance
-scp -r server/ vvm33:/data/blockscope-server/
+scp -r hopper/ vvm33:/data/blockscope-hopper/
 
 ssh vvm33
-cd /data/blockscope-server
+cd /data/blockscope-hopper
 chmod +x start.sh deploy-to-brev.sh
 ./start.sh
 ```
@@ -38,8 +38,8 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=/data/blockscope-server
-ExecStart=/data/blockscope-server/venv/bin/python /data/blockscope-server/app.py
+WorkingDirectory=/data/blockscope-hopper
+ExecStart=/data/blockscope-hopper/venv/bin/python /data/blockscope-hopper/app.py
 Restart=always
 
 [Install]

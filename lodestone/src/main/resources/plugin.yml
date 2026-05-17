@@ -1,0 +1,13 @@
+name: Lodestone
+version: '1.0.0'
+main: com.blockscope.lodestone.LodestonePlugin
+api-version: 1.19
+description: Blockscope session manager — per-player worlds, connection guard, bot control.
+authors: [blockscope]
+
+depend:
+  - PacketEvents
+
+softdepend: []
+
+commands: {}

@@ -1,0 +1,15 @@
+# Gradle build output
+.gradle/
+build/
+out/
+
+# Test server — Paper jar + world data, never commit
+test-server/
+
+# IDE
+.idea/
+*.iml
+
+# Misc
+*.log
+__pycache__/
