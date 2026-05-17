@@ -28,6 +28,7 @@ Output: scripts/beta_world.zip — drag into the Data Packs screen when creating
 """
 
 import copy
+import io
 import json
 import zipfile
 from pathlib import Path
@@ -308,83 +309,181 @@ def disable_ss(vanilla: dict) -> dict:
 # Custom ruins from STRUCTURES_DIR/*.nbt
 # ---------------------------------------------------------------------------
 
-def make_ruins_files(nbt_dir: Path) -> dict[str, object]:
-    """
-    For every *.nbt in nbt_dir, build the necessary worldgen JSON so they
-    scatter randomly across the world as ruins.
-    Returns a dict of zip_path → bytes/str to write into the output zip.
-    """
-    nbt_files = sorted(nbt_dir.glob("*.nbt"))
-    if not nbt_files:
-        return {}
-
-    names = [f.stem for f in nbt_files]   # e.g. ["brickwall", "herobrine", ...]
-    out: dict[str, object] = {}
-
-    # NBT files under beta_world namespace
-    for f in nbt_files:
-        out[f"data/beta_world/structures/{f.name}"] = f.read_bytes()
-
-    # Template pool: randomly picks one ruin piece
-    out["data/beta_world/worldgen/template_pool/ruins.json"] = json.dumps({
-        "name": "beta_world:ruins",
-        "fallback": "minecraft:empty",
-        "elements": [
-            {
-                "weight": 1,
-                "element": {
-                    "element_type": "minecraft:single_pool_element",
-                    "location": f"beta_world:{name}",
-                    "projection": "rigid",
-                    "processors": {"processors": []},
-                },
-            }
-            for name in names
-        ],
-    }, indent=2)
-
-    # Structure definition
-    out["data/beta_world/worldgen/structure/ruin.json"] = json.dumps({
-        "type": "minecraft:jigsaw",
-        "biomes": "#beta_world:has_structure/ruin",
-        "max_distance_from_center": 80,
-        "project_start_to_heightmap": "WORLD_SURFACE_WG",
-        "size": 1,
-        "spawn_overrides": {},
-        "start_height": {"absolute": 0},
-        "start_pool": "beta_world:ruins",
-        "step": "surface_structures",
-        "terrain_adaptation": "none",
-        "use_expansion_hack": False,
-    }, indent=2)
-
-    # Biome tag: spawn ruins in all main overworld biomes
-    out["data/beta_world/tags/worldgen/biome/has_structure/ruin.json"] = json.dumps({
-        "values": [
-            "minecraft:plains", "minecraft:forest",
-            "minecraft:desert", "minecraft:swamp",
-            "minecraft:windswept_hills", "minecraft:beach",
-        ]
-    }, indent=2)
-
-    # Structure set: scattered every ~20 chunks
-    out["data/beta_world/worldgen/structure_set/ruins.json"] = json.dumps({
-        "structures": [{"structure": "beta_world:ruin", "weight": 1}],
-        "placement": {
-            "type": "minecraft:random_spread",
-            "salt": 13371337,
-            "separation": 6,
-            "spacing": 20,
-        },
-    }, indent=2)
-
-    return out
-
-
 def mineshafts_no_mesa(vanilla: dict) -> dict:
     ss = copy.deepcopy(vanilla)
     ss["structures"] = [s for s in ss["structures"] if s["structure"] != "minecraft:mineshaft_mesa"]
     return ss
+
+
+# ---------------------------------------------------------------------------
+# OldVillages NBT block substitution
+# ---------------------------------------------------------------------------
+
+def patch_structure_nbt(data: bytes) -> bytes:
+    """
+    Rewrite a structure NBT's palette to remove new-era crops and workstations.
+    Crops → wheat (age=7), workstations → air, smoker → furnace, spruce gate → oak gate.
+    Handles both gzip-compressed and raw (uncompressed) NBT transparently.
+    """
+    import nbtlib
+
+    _SWAPS = {
+        # Non-wheat crops → fully-grown wheat
+        "minecraft:beetroots":          ("minecraft:wheat",          {"age": "7"}),
+        "minecraft:carrots":            ("minecraft:wheat",          {"age": "7"}),
+        "minecraft:potatoes":           ("minecraft:wheat",          {"age": "7"}),
+        # Villager workstations → air (all "new" blocks)
+        "minecraft:composter":          ("minecraft:air",            {}),
+        "minecraft:grindstone":         ("minecraft:air",            {}),
+        "minecraft:lectern":            ("minecraft:air",            {}),
+        # Keep orientation; upgrade to classic equivalent
+        "minecraft:smoker":             ("minecraft:furnace",        None),
+        "minecraft:spruce_fence_gate":  ("minecraft:oak_fence_gate", None),
+    }
+
+    # OldVillages stores NBTs uncompressed inside the zip; custom ones may be gzipped
+    is_gzipped = data[:2] == b"\x1f\x8b"
+    nbt = nbtlib.load(io.BytesIO(data), gzipped=is_gzipped)
+
+    for entry in nbt["palette"]:
+        name = str(entry["Name"])
+        if name not in _SWAPS:
+            continue
+        new_name, new_props = _SWAPS[name]
+        entry["Name"] = nbtlib.String(new_name)
+        if new_props is None:
+            pass                            # keep existing Properties (facing, open…)
+        elif not new_props:
+            entry.pop("Properties", None)   # air has no properties
+        else:
+            entry["Properties"] = nbtlib.Compound(
+                {k: nbtlib.String(v) for k, v in new_props.items()}
+            )
+
+    buf = io.BytesIO()
+    # save() respects gzip, write() does not — always emit gzipped so Minecraft's
+    # structure loader (readCompressed) can read the file correctly.
+    nbt.save(buf, gzipped=True)
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Custom structures: separate structure sets per group
+# ---------------------------------------------------------------------------
+
+_STRUCTURE_GROUPS = [
+    {
+        "name": "ruins",
+        "pieces": ["cobblewall", "mossycobblewall", "brickwall"],
+        "spacing": 12,   # very frequent — scattered debris everywhere
+        "separation": 4,
+        "start_height": 0,
+        "salt": 13371337,
+    },
+    {
+        "name": "herobrine",
+        "pieces": ["herobrine"],
+        "spacing": 60,   # rare landmark
+        "separation": 15,
+        "start_height": 0,
+        "salt": 66613371,
+    },
+    {
+        "name": "orewall",
+        "pieces": ["orewall"],
+        "spacing": 20,
+        "separation": 6,
+        "start_height": -1,   # -1 so it sits flush on the surface (WORLD_SURFACE_WG counts surface block)
+        "salt": 77713371,
+    },
+    {
+        "name": "shrines",
+        "pieces": ["diamondpillar", "bedrock"],
+        "spacing": 45,   # notable but not everywhere
+        "separation": 12,
+        "start_height": 0,
+        "salt": 88813371,
+    },
+]
+
+_STRUCTURE_BIOMES = [
+    "minecraft:plains", "minecraft:forest", "minecraft:desert",
+    "minecraft:swamp", "minecraft:windswept_hills",
+]
+
+
+def make_custom_structures(nbt_dir: Path) -> dict[str, object]:
+    """
+    Build worldgen JSON for every *.nbt in nbt_dir.
+    Each _STRUCTURE_GROUPS entry gets its own template_pool / structure / biome_tag /
+    structure_set so they can have independent placement frequencies.
+    Returns a dict of zip_path → bytes/str to write into the output zip.
+    """
+    available = {f.stem for f in nbt_dir.glob("*.nbt")}
+    if not available:
+        return {}
+
+    out: dict[str, object] = {}
+
+    for f in sorted(nbt_dir.glob("*.nbt")):
+        out[f"data/beta_world/structures/{f.name}"] = f.read_bytes()
+
+    for group in _STRUCTURE_GROUPS:
+        gname  = group["name"]
+        pieces = [p for p in group["pieces"] if p in available]
+        if not pieces:
+            continue
+
+        # Template pool — randomly picks one piece from the group
+        out[f"data/beta_world/worldgen/template_pool/{gname}.json"] = json.dumps({
+            "name": f"beta_world:{gname}",
+            "fallback": "minecraft:empty",
+            "elements": [
+                {
+                    "weight": 1,
+                    "element": {
+                        "element_type": "minecraft:single_pool_element",
+                        "location": f"beta_world:{p}",
+                        "projection": "rigid",
+                        "processors": {"processors": []},
+                    },
+                }
+                for p in pieces
+            ],
+        }, indent=2)
+
+        # Structure definition
+        out[f"data/beta_world/worldgen/structure/{gname}.json"] = json.dumps({
+            "type": "minecraft:jigsaw",
+            "biomes": f"#beta_world:has_structure/{gname}",
+            "max_distance_from_center": 80,
+            "project_start_to_heightmap": "WORLD_SURFACE_WG",
+            "size": 1,
+            "spawn_overrides": {},
+            "start_height": {"absolute": group["start_height"]},
+            "start_pool": f"beta_world:{gname}",
+            "step": "surface_structures",
+            "terrain_adaptation": "none",
+            "use_expansion_hack": False,
+        }, indent=2)
+
+        # Biome tag
+        out[f"data/beta_world/tags/worldgen/biome/has_structure/{gname}.json"] = json.dumps({
+            "values": _STRUCTURE_BIOMES,
+        }, indent=2)
+
+        # Structure set
+        out[f"data/beta_world/worldgen/structure_set/{gname}.json"] = json.dumps({
+            "structures": [{"structure": f"beta_world:{gname}", "weight": 1}],
+            "placement": {
+                "type": "minecraft:random_spread",
+                "salt": group["salt"],
+                "separation": group["separation"],
+                "spacing": group["spacing"],
+            },
+        }, indent=2)
+
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -474,7 +573,7 @@ def main():
             zout.writestr(f"data/minecraft/worldgen/configured_feature/{cf_name}.json",
                           json.dumps(SMALL_OAK_CF, indent=2))
 
-        # OldVillages — with tuned village frequency
+        # OldVillages — with tuned village frequency + NBT surgery
         print(f"  Merging {OLD_VILLAGES_ZIP.name}")
         ov_count = 0
         with zipfile.ZipFile(OLD_VILLAGES_ZIP) as zov:
@@ -488,18 +587,19 @@ def main():
                     ss["placement"]["separation"] = VILLAGE_SEPARATION
                     data = json.dumps(ss, indent=2).encode()
                     print(f"    village spacing={VILLAGE_SPACING} separation={VILLAGE_SEPARATION}")
+                elif item.filename.endswith(".nbt"):
+                    data = patch_structure_nbt(data)
                 zout.writestr(item.filename, data)
                 ov_count += 1
         print(f"  OldVillages files merged: {ov_count}")
 
-        # Custom ruins
-        ruins = make_ruins_files(STRUCTURES_DIR)
-        for path, content in ruins.items():
-            if isinstance(content, bytes):
-                zout.writestr(path, content)
-            else:
-                zout.writestr(path, content.encode() if isinstance(content, str) else content)
-        print(f"  Custom ruins: {len([p for p in ruins if p.endswith('.nbt')])} structures")
+        # Custom structures (split into separate structure sets)
+        custom = make_custom_structures(STRUCTURES_DIR)
+        for path, content in custom.items():
+            zout.writestr(path, content if isinstance(content, bytes) else content.encode())
+        nbt_count = len([p for p in custom if p.endswith(".nbt")])
+        grp_count = len([p for p in custom if p.startswith("data/beta_world/worldgen/structure_set/")])
+        print(f"  Custom structures: {nbt_count} NBTs, {grp_count} structure sets")
 
         # Cascades density functions + noise parameters
         print(f"  Merging {CASCADES_ZIP.name} terrain data")
@@ -519,7 +619,7 @@ def main():
     print(f"  OldVillages files : {ov_count}")
     print(f"  Cascades files    : {cascades_count}")
     print(f"  Unique biomes in source: {len(unique_biomes)}")
-    print(f"  Custom ruins: {len(list(STRUCTURES_DIR.glob('*.nbt')))} structures")
+    print(f"  Custom structures : {len(list(STRUCTURES_DIR.glob('*.nbt')))} NBTs across {len(_STRUCTURE_GROUPS)} groups")
 
 
 if __name__ == "__main__":
