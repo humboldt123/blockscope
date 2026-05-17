@@ -4,11 +4,13 @@ import com.blockscope.agent.BotModule;
 import com.blockscope.agent.InventoryChaosAgent;
 import com.blockscope.gui.ConfigScreen;
 import com.blockscope.network.LoginProtocol;
+import com.blockscope.network.SessionProtocol;
 import com.blockscope.recording.RecordingManager;
 import com.blockscope.util.FfmpegChecker;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.util.InputUtil;
@@ -46,6 +48,19 @@ public class BlockscopeClient implements ClientModInitializer {
 
         replayModIntegration = new ReplayModIntegration();
         replayModIntegration.register();
+        SessionProtocol.registerClient(replayModIntegration);
+
+        // Stop recording and bot immediately on disconnect so the server select /
+        // disconnect screen never leaks into the video.
+        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
+            if (RecordingManager.getInstance().isRecording()) {
+                System.out.println("[Blockscope] Disconnect — stopping recording");
+                RecordingManager.getInstance().stopRecording();
+            }
+            if (baritonePresent && BotModule.getInstance().isRunning()) {
+                BotModule.getInstance().stop();
+            }
+        });
 
         recordingToggleKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
             "key.blockscope.toggle_recording",

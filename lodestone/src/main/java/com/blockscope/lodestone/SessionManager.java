@@ -236,11 +236,18 @@ public class SessionManager implements Listener {
                 scheduleToolCheck(player);
             }
 
-            // Always send session_start so the mod auto-starts recording + bot
-            sendSessionStart(player, modeStr);
-
             plugin.getLogger().info("Session: " + player.getName() +
                 " → " + finalWorld.getName() + " [" + modeStr + "]");
+
+            // Delay session_start by 40 ticks so the client finishes loading the new
+            // world before we send the packet (teleport causes a dimension-change/respawn
+            // packet sequence; plugin messages sent mid-switch are silently dropped).
+            Bukkit.getScheduler().runTaskLater(plugin, () -> {
+                if (player.isOnline()) {
+                    sendSessionStart(player, modeStr);
+                    plugin.getLogger().info("Sent session_start → " + player.getName() + " [" + modeStr + "]");
+                }
+            }, 40L);
         });
 
         // Session timer — kick after duration so client auto-reconnects

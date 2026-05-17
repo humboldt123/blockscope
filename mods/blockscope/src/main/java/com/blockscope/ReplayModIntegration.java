@@ -62,6 +62,8 @@ public class ReplayModIntegration {
         }
     }
 
+    public boolean isRecording() { return isReplayModRecording(); }
+
     /**
      * Called from the keybinding handler. Starts ReplayMod recording if idle,
      * or stops it if already recording. Our tick poll picks up the state change.
