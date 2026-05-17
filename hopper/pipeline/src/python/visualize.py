@@ -434,11 +434,13 @@ def render_perspective_view(
     pose: dict,
     out_w: int = IMG_W,
     out_h: int = IMG_H,
+    fullbright: bool = False,
 ) -> np.ndarray:
     """
     Perspective-correct textured block render.
     Uses Numba barycentric rasterizer + texture atlas (~50-200× faster than
     the old per-face homography approach).
+    fullbright=True skips the light level and renders everything at max brightness.
     """
     from lighting import compute_lightmap, beta17_brightness
 
@@ -458,7 +460,7 @@ def render_perspective_view(
     aspect = out_w / out_h
     tan_hv = math.tan(fov_v / 2)
     tan_hh = tan_hv * aspect
-    NEAR   = 0.5
+    NEAR   = 0.05   # matches Minecraft's actual near plane
     half_w = out_w / 2.0
     half_h = out_h / 2.0
 
@@ -522,12 +524,15 @@ def render_perspective_view(
                 sy_ = -( verts @ up)    * inv_vd * half_h / tan_hv + half_h
 
                 # Lighting: sample adjacent cell
-                li = gi + nx;  lj = gj + ny;  lk = gk + nz
-                if 0 <= li < 32 and 0 <= lj < 32 and 0 <= lk < 32:
-                    lv = int(lightmap[li, lj, lk])
+                if fullbright:
+                    br_ = min(1.0, _RENDER_BRIGHTNESS * float(_FACE_BRIGHTNESS[(nx, ny, nz)]))
                 else:
-                    lv = int(lightmap[gi, gj, gk])
-                br_ = min(1.0, _RENDER_BRIGHTNESS * float(_FACE_BRIGHTNESS[(nx, ny, nz)]) * beta17_brightness(lv / 15.0))
+                    li = gi + nx;  lj = gj + ny;  lk = gk + nz
+                    if 0 <= li < 32 and 0 <= lj < 32 and 0 <= lk < 32:
+                        lv = int(lightmap[li, lj, lk])
+                    else:
+                        lv = int(lightmap[gi, gj, gk])
+                    br_ = min(1.0, _RENDER_BRIGHTNESS * float(_FACE_BRIGHTNESS[(nx, ny, nz)]) * beta17_brightness(lv / 15.0))
 
                 # Atlas UV
                 face_dir    = _NORMAL_TO_DIR[(nx, ny, nz)]

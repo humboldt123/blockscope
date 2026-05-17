@@ -23,10 +23,11 @@ def load_blockstate_table(pipeline_root: Path):
     """
     Load pipeline/data/blockstate_table_1.19.4.json and return numpy arrays
     suitable for the Numba raycaster:
-      opaque     : uint8[max_state_id+1]   — 1=opaque, 0=transparent
-      aabb_start : int32[max_state_id+1]   — start index into flat_aabbs
-      aabb_count : int32[max_state_id+1]   — number of AABBs
-      flat_aabbs : float32[N, 6]           — all AABBs packed
+      opaque        : uint8[max_state_id+1]   — 1=opaque, 0=transparent
+      terminates_ray: uint8[max_state_id+1]   — 1 if ray stops here (opaque OR leaf)
+      aabb_start    : int32[max_state_id+1]   — start index into flat_aabbs
+      aabb_count    : int32[max_state_id+1]   — number of AABBs
+      flat_aabbs    : float32[N, 6]           — all AABBs packed
     """
     json_path = pipeline_root / "data" / "blockstate_table_1.19.4.json"
     log.info("Loading blockstate table from %s", json_path)
@@ -36,15 +37,25 @@ def load_blockstate_table(pipeline_root: Path):
     states = table["states"]
     n = len(states)
 
-    opaque     = np.zeros(n, dtype=np.uint8)
-    aabb_start = np.zeros(n, dtype=np.int32)
-    aabb_count = np.zeros(n, dtype=np.int32)
+    opaque         = np.zeros(n, dtype=np.uint8)
+    terminates_ray = np.zeros(n, dtype=np.uint8)
+    aabb_start     = np.zeros(n, dtype=np.int32)
+    aabb_count     = np.zeros(n, dtype=np.int32)
 
     aabb_list = []
     offset = 0
     for sid, entry in enumerate(states):
         opaque[sid]     = 1 if entry["opaque"] else 0
-        aabbs           = entry["aabbs"]          # [[x0,y0,z0,x1,y1,z1], ...]
+        # Leaves terminate rays on Fast graphics (rendered solid) but aren't opaque for light
+        is_leaf = "leaves" in entry.get("name", "")
+        terminates_ray[sid] = 1 if (entry["opaque"] or is_leaf) else 0
+        aabbs = entry["aabbs"]          # [[x0,y0,z0,x1,y1,z1], ...]
+        # Cross-shaped blocks (ferns, flowers, grass, …) have no collision AABB
+        # but are still visible. Give them a thin centred hitbox so rays can
+        # detect them without treating them as solid — terminates_ray stays 0
+        # so rays continue through to hit the ground beneath.
+        if not aabbs and entry.get("name", "") not in ("minecraft:air", "minecraft:void_air", "minecraft:cave_air"):
+            aabbs = [[0.3, 0.0, 0.3, 0.7, 0.9, 0.7]]
         aabb_start[sid] = offset
         aabb_count[sid] = len(aabbs)
         for box in aabbs:
@@ -53,7 +64,7 @@ def load_blockstate_table(pipeline_root: Path):
 
     flat_aabbs = np.array(aabb_list, dtype=np.float32).reshape(-1, 6) if aabb_list else np.zeros((0, 6), dtype=np.float32)
     log.info("Blockstate table: %d states, %d total AABBs", n, len(aabb_list) // 6)
-    return opaque, aabb_start, aabb_count, flat_aabbs
+    return opaque, terminates_ray, aabb_start, aabb_count, flat_aabbs
 
 
 # ---------- world_states.bin -------------------------------------------------

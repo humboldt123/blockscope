@@ -170,7 +170,7 @@ def main():
             if tick_num != last_tick_num and tick_num is not None:
                 try:
                     m, b, s, inv, pose = load_tick_npz(labels_dir, tick_num)
-                    last_voxel = render_perspective_view(m, b, pose)
+                    last_voxel = render_perspective_view(m, b, pose, fullbright=True)
                 except Exception as e:
                     log.warning("Failed tick %s: %s", tick_num, e)
                 last_tick_num = tick_num

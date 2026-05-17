@@ -289,7 +289,10 @@ public class RecordingManager {
             cs.yaw = cam.getYaw();
             state.camera = cs;
         }
-        state.fov = (float) client.options.getFov().getValue();
+        // GameRenderer multiplies the settings FOV by getFovMultiplier() before rendering.
+        // This accounts for sprinting, speed/slowness effects, etc.
+        float fovMultiplier = (client.player != null) ? client.player.getFovMultiplier() : 1.0f;
+        state.fov = (float)(client.options.getFov().getValue() * fovMultiplier);
         state.mouseSensitivity = client.options.getMouseSensitivity().getValue();
         state.health = player.getHealth();
         state.hunger = player.getHungerManager().getFoodLevel();

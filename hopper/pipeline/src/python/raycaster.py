@@ -61,7 +61,8 @@ def _cast_ray(
     cam_wx, cam_wy, cam_wz,   # camera in window coords
     dx, dy, dz,                # normalised ray direction
     world,                     # uint16 (32,32,32)
-    opaque,                    # uint8  (N,)
+    opaque,                    # uint8  (N,)  — unused here, kept for symmetry
+    terminates_ray,            # uint8  (N,)  — 1 if ray stops (opaque OR leaf)
     aabb_start,                # int32  (N,)
     aabb_count,                # int32  (N,)
     flat_aabbs,                # float32(M,6)
@@ -119,8 +120,8 @@ def _cast_ray(
                         break
                 if hit:
                     visibility[cx, cy, cz] = 1
-                    if opaque[sid]:
-                        return    # opaque block — ray terminates
+                    if terminates_ray[sid]:
+                        return    # opaque or leaf (Fast graphics) — ray terminates
 
         # Advance DDA
         if tx <= ty and tx <= tz:
@@ -140,7 +141,7 @@ def _cast_all_rays(
     up_x, up_y, up_z,
     half_w, half_h,
     width, height,
-    opaque, aabb_start, aabb_count, flat_aabbs,
+    opaque, terminates_ray, aabb_start, aabb_count, flat_aabbs,
     occ_c0, occ_c1, occ_r0, occ_r1,   # F5 player-model occlusion rect (inclusive)
 ):
     visibility = np.zeros((WINDOW, WINDOW, WINDOW), dtype=np.uint8)
@@ -166,7 +167,7 @@ def _cast_all_rays(
             rdx /= rlen;  rdy /= rlen;  rdz /= rlen
 
             _cast_ray(cam_wx, cam_wy, cam_wz, rdx, rdy, rdz,
-                      world, opaque, aabb_start, aabb_count, flat_aabbs,
+                      world, opaque, terminates_ray, aabb_start, aabb_count, flat_aabbs,
                       visibility)
 
     return visibility
@@ -180,7 +181,7 @@ def compute_visibility(
     world_u16,         # uint16 (32,32,32) — block state IDs, window coords
     tick,              # tick dict from ticks.jsonl
     player_block_pos,  # (px, py, pz) integer block coords (window origin = pos-15)
-    opaque, aabb_start, aabb_count, flat_aabbs,  # blockstate table arrays
+    opaque, terminates_ray, aabb_start, aabb_count, flat_aabbs,  # blockstate table arrays
 ) -> np.ndarray:
     """
     Cast 640×360 rays from the camera and return uint8 (32,32,32) visibility mask.
@@ -198,9 +199,7 @@ def compute_visibility(
     fwd, right, up = camera_vectors(cam["yaw"], cam["pitch"])
 
     aspect = IMG_W / IMG_H
-    # Expand FOV slightly so edge blocks aren't missed due to float precision
-    # or minor differences between the game's internal FOV and the recorded value.
-    half_h = math.tan(math.radians(fov / 2)) * 1.05
+    half_h = math.tan(math.radians(fov / 2))
     half_w = aspect * half_h
 
     # Camera position in window coords: world_coord - (px-15, py-15, pz-15)
@@ -229,7 +228,7 @@ def compute_visibility(
         float(up[0]), float(up[1]), float(up[2]),
         half_w, half_h,
         IMG_W, IMG_H,
-        opaque, aabb_start, aabb_count, flat_aabbs,
+        opaque, terminates_ray, aabb_start, aabb_count, flat_aabbs,
         int(occ_c0), int(occ_c1), int(occ_r0), int(occ_r1),
     )
     return vis
