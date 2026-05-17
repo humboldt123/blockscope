@@ -175,7 +175,7 @@ def run_test():
     T          = len(ticks)
 
     px_arr, py_arr, pz_arr, blocks = load_world_states(labels_dir)
-    opaque, aabb_start, aabb_count, flat_aabbs = load_blockstate_table(PIPELINE_ROOT)
+    opaque, terminates_ray, aabb_start, aabb_count, flat_aabbs = load_blockstate_table(PIPELINE_ROOT)
 
     # ── Global sanity: tick-0 s==0 ────────────────────────────────────────────
     m0, b0, s0, _, _ = load_tick_npz(labels_dir, ticks[0]["tick"])

@@ -67,7 +67,7 @@ def run_stage2(session_dir: Path, labels_dir: Path):
     ticks = [json.loads(l) for l in
              (session_dir / "ticks.jsonl").read_text().splitlines() if l]
 
-    opaque, aabb_start, aabb_count, flat_aabbs = load_blockstate_table(PIPELINE_ROOT)
+    opaque, terminates_ray, aabb_start, aabb_count, flat_aabbs = load_blockstate_table(PIPELINE_ROOT)
     px_arr, py_arr, pz_arr, blocks = load_world_states(labels_dir)
 
     T = len(ticks)
@@ -85,7 +85,7 @@ def run_stage2(session_dir: Path, labels_dir: Path):
             blocks[t_idx],
             tick,
             (int(px_arr[t_idx]), int(py_arr[t_idx]), int(pz_arr[t_idx])),
-            opaque, aabb_start, aabb_count, flat_aabbs,
+            opaque, terminates_ray, aabb_start, aabb_count, flat_aabbs,
         )
         m_all[t_idx] = m
 
