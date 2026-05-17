@@ -396,10 +396,32 @@ public class RecordingManager {
         return state;
     }
 
+    private static String screenTypeName(Screen screen) {
+        // instanceof checks survive runtime remapping; getSimpleName() returns obfuscated intermediary names.
+        if (screen instanceof net.minecraft.client.gui.screen.ingame.InventoryScreen)        return "inventory";
+        if (screen instanceof net.minecraft.client.gui.screen.ingame.CraftingScreen)         return "crafting_table";
+        if (screen instanceof net.minecraft.client.gui.screen.ingame.GenericContainerScreen) return "chest";
+        if (screen instanceof net.minecraft.client.gui.screen.ingame.AbstractFurnaceScreen)  return "furnace";
+        if (screen instanceof net.minecraft.client.gui.screen.ingame.HopperScreen)           return "hopper";
+        if (screen instanceof net.minecraft.client.gui.screen.ingame.AnvilScreen)            return "anvil";
+        if (screen instanceof net.minecraft.client.gui.screen.ingame.EnchantmentScreen)      return "enchanting_table";
+        if (screen instanceof net.minecraft.client.gui.screen.ingame.BrewingStandScreen)     return "brewing_stand";
+        if (screen instanceof net.minecraft.client.gui.screen.ingame.BeaconScreen)           return "beacon";
+        if (screen instanceof net.minecraft.client.gui.screen.ingame.CartographyTableScreen) return "cartography_table";
+        if (screen instanceof net.minecraft.client.gui.screen.ingame.LoomScreen)             return "loom";
+        if (screen instanceof net.minecraft.client.gui.screen.ingame.SmithingScreen)         return "smithing_table";
+        if (screen instanceof net.minecraft.client.gui.screen.ingame.StonecutterScreen)      return "stonecutter";
+        if (screen instanceof net.minecraft.client.gui.screen.ingame.MerchantScreen)         return "merchant";
+        if (screen instanceof net.minecraft.client.gui.screen.ChatScreen)                    return "chat";
+        if (screen instanceof net.minecraft.client.gui.screen.GameMenuScreen)                return "pause_menu";
+        if (screen instanceof net.minecraft.client.gui.screen.TitleScreen)                   return "title";
+        return screen.getClass().getSimpleName();
+    }
+
     private TickData.GuiState captureGuiState(Screen screen) {
         TickData.GuiState state = new TickData.GuiState();
         if (screen == null) return state;
-        state.screenType = screen.getClass().getSimpleName();
+        state.screenType = screenTypeName(screen);
         MinecraftClient client = MinecraftClient.getInstance();
         double mx = client.mouse.getX() * client.getWindow().getScaledWidth() / client.getWindow().getWidth();
         double my = client.mouse.getY() * client.getWindow().getScaledHeight() / client.getWindow().getHeight();

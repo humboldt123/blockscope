@@ -443,8 +443,14 @@ async def finalize_video_internal(session_id: str):
         if not session_dir.exists():
             raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
 
-        # Find all segments
-        segments = sorted(glob.glob(str(session_dir / "segment_*.ts")))
+        # Find all segments — sort numerically, not lexicographically,
+        # so segment_10 comes after segment_9 not after segment_1.
+        import re
+        def _seg_key(p):
+            m = re.search(r'(\d+)', Path(p).stem)
+            return int(m.group(1)) if m else 0
+
+        segments = sorted(glob.glob(str(session_dir / "segment_*.ts")), key=_seg_key)
 
         if not segments:
             logger.warning(f"No segments found for {session_id}, skipping finalization")

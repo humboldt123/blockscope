@@ -9,8 +9,8 @@ Data collection infrastructure for training Minecraft AI agents. See `paper/` fo
 | [`mods/blockscope/`](mods/blockscope/) | Fabric mod — records gameplay (video, inputs, tick state) and uploads to the server |
 | [`mods/replaymod/`](mods/replaymod/) | Records raw network packets alongside blockscope for ground-truth world reconstruction |
 | [`mods/baritone/`](mods/baritone/) | Pathfinding AI, driven via its API from blockscope agent modes |
-| [`server/`](server/) | FastAPI upload endpoint — runs in the cloud, receives sessions from N mod users |
-| [`hopper/`](hopper/) | Processing pipeline — converts raw `.mcpr` + metadata into voxel grids with visibility masks |
+| [`hopper/`](hopper/) | FastAPI upload endpoint — runs in the cloud, receives sessions from N mod users |
+| [`furnace/`](furnace/) | Processing pipeline — converts raw `.mcpr` + metadata into voxel grids with visibility masks |
 | [`visualizer/`](visualizer/) | OpenGL viewer — inspect collected sessions interactively |
 
 ## Data flow
@@ -20,11 +20,11 @@ N players running blockscope + replaymod
             │
             │  uploads: video, inputs, tick metadata, .mcpr
             ▼
-      blockscope server  (Brev cloud)
+      hopper  (FastAPI, Brev cloud)
             │
             │  raw recordings pulled for processing
             ▼
-      hopper pipeline  (.mcpr → voxel grids + visibility masks)
+      furnace  (.mcpr → voxel grids + visibility masks)
             │
             ▼
       training  (on server — not in this repo)

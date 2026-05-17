@@ -1,0 +1,138 @@
+IDEA: Shared multi-world data collection server
+================================================
+
+Goal: a single persistent Paper server that any number of clients can connect
+to and each one lands in a private, freshly-generated world so they never see
+each other and every session has a unique seed.
+
+Architecture
+------------
+- Paper 1.19.4 server, always-on (Linux box where training runs)
+- A custom Paper plugin that:
+    1. Denies connection at the login phase (before join) if the client does not
+       have the Blockscope mod or does not have working ffmpeg — see "Connection
+       guard" section below.
+    2. On player join: generates a new world with a random seed + the beta
+       worldgen datapack, assigns the player to it exclusively.
+    3. Assigns the session a mode (CREATIVE or SURVIVAL) — see "Session modes"
+       below — and signals the client via a plugin channel packet so the mod
+       auto-starts the correct Baritone script.
+    4. On session end (timeout or client disconnect): tears down the private
+       world and frees the slot.
+- The Blockscope mod on the CLIENT handles all recording and uploads.
+  No changes needed to the client-side recording pipeline.
+
+Why Paper over Fabric server
+-----------------------------
+- Paper is a drop-in replacement for vanilla — no mods needed server-side.
+- Multiverse-Core (Paper plugin) handles per-player world lifecycle.
+- Plugin API is stable; datapacks still load from the server's datapack folder.
+
+Connection guard (deny before join, not kick after)
+----------------------------------------------------
+The Blockscope client mod responds to a "blockscope:login_check" login-phase
+channel query with [modPresent=1, ffmpegOk=0/1].  If no response or ffmpeg=0,
+the Paper plugin closes the connection before the player fully joins (client
+sees "Failed to connect", not a kick screen).
+Recommended implementation: PacketEvents library to intercept login packets.
+
+Session modes and Baritone control
+------------------------------------
+The plugin assigns each joining player a mode (configurable toggle per mode
+in plugin config, e.g. baritone_creative_enabled: true):
+
+  CREATIVE mode:
+    - Plugin sets player to creative, sends "blockscope:session_start" packet
+      with payload { mode: "creative", duration_seconds: 1800 }.
+    - Client mod receives packet → auto-starts recording + BotModule CREATIVE_SURVEY.
+    - After duration, mod stops recording and disconnects.
+    - Plugin detects disconnect → tears down world → ready for next client.
+
+  SURVIVAL mode:
+    - Plugin sets player to survival, sends "blockscope:session_start"
+      with { mode: "survival", duration_seconds: 1800 }.
+    - Client mod receives packet → auto-starts recording + BotModule SURVIVAL_GATHER.
+    - On spawn, plugin /gives a RANDOM tool tier set (see "Tool randomisation" below).
+    - After duration, mod stops recording and disconnects.
+
+Tool randomisation (survival only)
+-------------------------------------
+On player spawn and whenever plugin detects the player's pickaxe slot is empty
+(checked every ~30 s), give a new random tool tier:
+  Tiers (chosen uniformly at random): gold, wood, stone, iron, diamond
+  Items given per tier: pickaxe + axe + shovel + sword of that material,
+                        16 torches, 16 bread.
+This ensures a variety of tool durability and mining-speed events in the data
+without the bot needing to craft.
+
+Plugin config (config.yml) toggles
+-------------------------------------
+  baritone_control_enabled: true   # if false, client controls bot mode manually
+  creative_sessions_enabled: true
+  survival_sessions_enabled: true
+  session_duration_seconds: 1800
+  tool_randomisation_enabled: true
+  tool_check_interval_seconds: 30
+
+Server difficulty
+------------------
+Server runs on PEACEFUL permanently (set in server.properties: difficulty=peaceful).
+No hunger, no mob spawns — bots never die or get stuck fighting.
+
+Per-player world creation
+-------------------------
+- Multiverse-Core: addWorld(sessionId, NORMAL, randomSeed, ...) on join.
+- Beta worldgen datapack symlinked into each new world's datapack folder.
+- World deleted on session end.
+
+World preloading (avoid slow join)
+------------------------------------
+Generating and loading a world on-demand when a player connects is slow (5-15 s
+of terrain gen before they can move).  Instead, maintain a pool of N pre-generated
+worlds ready to assign:
+
+  - A background task generates and fully loads POOL_SIZE (e.g. 3) worlds at
+    server startup and whenever the pool drops below a low-water mark (e.g. 1).
+  - Each pre-generated world is force-loaded with Bukkit's
+    world.getChunkAt(x, z).load(true) in a spiral around spawn so the initial
+    area is already in memory when the player arrives.
+  - On player join, instantly assign the next world from the pool head and kick
+    off generation of a replacement in the background.
+  - POOL_SIZE is configurable in plugin config; set to 1 on low-RAM machines.
+
+Spawn point targeting (before player joins)
+---------------------------------------------
+When pre-generating a world, after terrain gen is complete:
+  - 1/5 of the time: /locate structure minecraft:village (old_village from the
+    datapack), setworldspawn at that location so the player spawns inside/adjacent
+    to the village.
+  - 1/5 of the time: /locate a random non-village structure (e.g. mineshaft,
+    dungeon, ruined_portal, desert_pyramid, jungle_temple) and setworldspawn there.
+  - 3/5 of the time: leave spawn wherever vanilla places it.
+This biases a meaningful fraction of sessions toward interesting structures without
+making every session the same.
+
+Session cycling (client side — TO ADD to mod)
+-----------------------------------------------
+- Mod receives "blockscope:session_start" → startRecording() + start bot.
+- Mod timer fires at duration → stopRecording() → disconnect().
+- Client auto-reconnects immediately → server assigns new world + mode → repeat.
+
+Client requirements
+-------------------
+- blockscope mod  (recording + upload + login check + session_start handler)
+- baritone-api-fabric-1.9.5.jar
+- replaymod-1.19.4-2.6.21.jar
+- fabric-api
+- ffmpeg on PATH
+
+TO IMPLEMENT (later)
+--------------------
+1. Write Paper plugin: PacketEvents connection guard + Multiverse world manager
+   + "blockscope:session_start" packet sender + tool randomisation.
+2. Add "blockscope:session_start" packet receiver to client mod → auto-starts
+   recording + correct BotModule mode.
+3. Add session timer to BotModule: after N seconds, stopRecording() + disconnect.
+4. Add auto-reconnect loop (reconnect on disconnect while data collection active).
+5. Test locally (loopback), then deploy Paper server to Linux training box.
+6. Point blockscope.properties server_url at the Linux collection FastAPI.

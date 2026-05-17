@@ -14,7 +14,7 @@ Detects your platform and installs config files into the right PrismLauncher dir
 |-----|---------|--------|
 | `blockscope-*.jar` | latest | `cd mods/blockscope && ./gradlew build` → `build/libs/` |
 | `replaymod-1.19.4-2.6.21.jar` | 2.6.21 | [replaymod.com/download](https://www.replaymod.com/download/) |
-| `baritone-standalone-fabric-1.9.5.jar` | 1.9.5 | [github.com/cabaletta/baritone/releases](https://github.com/cabaletta/baritone/releases) |
+| `baritone-api-fabric-1.9.5.jar` | 1.9.5 | [github.com/cabaletta/baritone/releases](https://github.com/cabaletta/baritone/releases) — use the **api** jar, not standalone |
 | `fabric-api-0.87.0+1.19.4.jar` | 0.87.0 | [modrinth.com/mod/fabric-api](https://modrinth.com/mod/fabric-api) |
 
 ## Manual setup
