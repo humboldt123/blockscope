@@ -148,13 +148,23 @@ DISABLE_STRUCTURE_SETS = {
     "villages",  # replaced by old_villages namespace
 }
 
-# Cascades density function paths to include (mc namespace overrides + hybrid_beta deps)
-# Excludes overworld_amplified and overworld_large_biomes — not needed for standard worlds
-CASCADES_DF_PREFIXES = (
-    "data/minecraft/worldgen/density_function/overworld/",
-    "data/minecraft/worldgen/density_function/overworld_amplified/",   # needed for sloped_cheese chain
-    "data/hybrid_beta/worldgen/density_function/",                     # dependency of sloped_cheese
+# Cascades paths to copy verbatim (density functions + noise parameters)
+# Excludes: dimension/overworld.json (we keep vanilla biome source),
+#           biome/ files (we have our own), other noise_settings presets
+CASCADES_INCLUDE_PREFIXES = (
+    "data/minecraft/worldgen/density_function/",   # all DFs incl. root-level shift_x/y/z
+    "data/hybrid_beta/worldgen/density_function/", # hybrid_beta DFs (sloped_cheese dep + caves)
+    "data/minecraft/worldgen/noise/",              # noise parameter overrides (continentalness, erosion…)
+    "data/hybrid_beta/worldgen/noise/",            # hybrid_beta noise defs (gravel_beach, sand_beach)
 )
+CASCADES_EXCLUDE_EXACT = {
+    # We handle overworld noise_settings ourselves; skip other presets
+    "data/minecraft/worldgen/noise_settings/amplified.json",
+    "data/minecraft/worldgen/noise_settings/caves.json",
+    "data/minecraft/worldgen/noise_settings/floating_islands.json",
+    "data/minecraft/worldgen/noise_settings/large_biomes.json",
+    "data/minecraft/worldgen/noise_settings/overworld.json",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -349,23 +359,25 @@ def main():
                     ov_count += 1
         print(f"  OldVillages files merged: {ov_count}")
 
-        # --- Cascades: copy terrain density function overrides ---
-        print(f"  Merging {CASCADES_ZIP.name} density functions")
-        df_count = 0
+        # --- Cascades: density functions + noise parameters ---
+        print(f"  Merging {CASCADES_ZIP.name} terrain data")
+        cascades_count = 0
         with zipfile.ZipFile(CASCADES_ZIP) as zca:
             for item in zca.infolist():
                 if item.filename.endswith("/"):
                     continue
-                if any(item.filename.startswith(pfx) for pfx in CASCADES_DF_PREFIXES):
+                if item.filename in CASCADES_EXCLUDE_EXACT:
+                    continue
+                if any(item.filename.startswith(pfx) for pfx in CASCADES_INCLUDE_PREFIXES):
                     zout.writestr(item.filename, zca.read(item.filename))
-                    df_count += 1
-        print(f"  Cascades density functions merged: {df_count}")
+                    cascades_count += 1
+        print(f"  Cascades files merged: {cascades_count}")
 
     print(f"\nDone → {OUT_ZIP}")
     print(f"  Biomes          : {len(cleaned)}")
     print(f"  Structure sets  : {len(out_ss)}  ({len(DISABLE_STRUCTURE_SETS)} disabled)")
     print(f"  OldVillages files: {ov_count}")
-    print(f"  Cascades DFs    : {df_count}")
+    print(f"  Cascades files  : {cascades_count}")
 
 
 if __name__ == "__main__":
