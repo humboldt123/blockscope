@@ -155,7 +155,8 @@ public class SegmentedTSEncoder {
         }
 
         framesInCurrentSegment = 0;
-        currentSegmentPath = sessionDir.resolve("segment_" + segmentIndex + ".ts");
+        // Zero-padded so lexicographic sort == numeric sort (segment_0000000010 > segment_0000000009)
+        currentSegmentPath = sessionDir.resolve(String.format("segment_%010d.ts", segmentIndex));
         segmentIndex++;
 
         // Start ffmpeg for this segment

@@ -300,6 +300,8 @@ public class SessionManager implements Listener {
         cancelToolCheck(uuid);
         Integer timerId = sessionTimers.remove(uuid);
         if (timerId != null) Bukkit.getScheduler().cancelTask(timerId);
+        // Guard: only handle once (disconnect can fire while timeout kick is processing)
+        if (playerWorlds.get(uuid) == null) return;
 
         World world = playerWorlds.remove(uuid);
         if (world == null) return;
@@ -310,7 +312,9 @@ public class SessionManager implements Listener {
             player.kick(net.kyori.adventure.text.Component.text("§aSession complete — reconnecting…"));
         }
 
-        Bukkit.getScheduler().runTaskLater(plugin, () -> unloadAndDeleteWorld(world), 40L);
+        // Unload after 2 ticks to ensure the player has left the world,
+        // but don't hold the reference any longer — worlds must not pile up.
+        Bukkit.getScheduler().runTaskLater(plugin, () -> unloadAndDeleteWorld(world), 2L);
     }
 
     private void unloadAndDeleteWorld(World world) {

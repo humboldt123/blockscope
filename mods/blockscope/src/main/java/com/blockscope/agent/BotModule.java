@@ -7,9 +7,15 @@ import baritone.api.process.IBaritoneProcess;
 import net.minecraft.block.Block;
 import net.minecraft.block.Blocks;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.item.Items;
 import net.minecraft.text.Text;
+import net.minecraft.util.ActionResult;
+import net.minecraft.util.Hand;
+import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.LightType;
 
 import java.util.Random;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -44,6 +50,8 @@ public class BotModule {
     private boolean lookInitialized = false;
     private boolean useFreeLook = false; // true only in creative survey
 
+    private int torchCheckTicks = 0;
+
     private BotModule() {}
 
     public static BotModule getInstance() {
@@ -53,6 +61,7 @@ public class BotModule {
 
     public boolean isRunning() { return running.get(); }
     public Mode    getMode()   { return mode; }
+    public void    setMode(Mode m) { if (!running.get()) mode = m; }
 
     public void cycleMode() {
         if (running.get()) { log("§c[Bot] Stop the bot before changing mode."); return; }
@@ -91,13 +100,16 @@ public class BotModule {
         if (!running.getAndSet(false)) return;
         useFreeLook = false;
         lookInitialized = false;
+        torchCheckTicks = 0;
         cancelBaritone();
         if (botThread != null) { botThread.interrupt(); botThread = null; }
     }
 
-    /** Called every game tick from BlockscopeClient. Drives look in creative survey. */
+    /** Called every game tick from BlockscopeClient. Drives look in creative survey; places torches in survival. */
     public void onTick(MinecraftClient mc) {
-        if (!running.get() || mc.player == null || !useFreeLook) return;
+        if (!running.get() || mc.player == null) return;
+        tickTorchCheck(mc);
+        if (!useFreeLook) return;
 
         // Seed initial position from actual player look so there's no jump on start
         if (!lookInitialized) {
@@ -137,6 +149,60 @@ public class BotModule {
 
         mc.player.setYaw((float) lookYaw);
         mc.player.setPitch((float) lookPitch);
+    }
+
+    // ── Torch placement ───────────────────────────────────────────────────────
+
+    /** Called every tick; fires the actual check only every 100 ticks (5 s). */
+    private void tickTorchCheck(MinecraftClient mc) {
+        if (useFreeLook || mc.player == null || mc.world == null) return;
+        if (++torchCheckTicks < 100) return;
+        torchCheckTicks = 0;
+        maybePlaceTorch(mc);
+    }
+
+    private void maybePlaceTorch(MinecraftClient mc) {
+        BlockPos pos = mc.player.getBlockPos();
+        if (mc.world.getLightLevel(LightType.BLOCK, pos) >= 5) return;
+        if (mc.world.getLightLevel(LightType.SKY, pos) >= 5) return;
+
+        int torchSlot = -1;
+        for (int i = 0; i < 9; i++) {
+            if (mc.player.getInventory().getStack(i).getItem() == Items.TORCH) { torchSlot = i; break; }
+        }
+        if (torchSlot == -1) return;
+
+        Direction facing = Direction.fromRotation(mc.player.getYaw());
+        Direction left   = facing.rotateYCounterclockwise();
+        Direction right  = facing.rotateYClockwise();
+
+        // Prefer wall to left / right (less likely to be in Baritone's path), floor last
+        for (Direction wallDir : new Direction[]{left, right}) {
+            for (int dy : new int[]{1, 0}) {
+                BlockPos wallBlock  = pos.up(dy).offset(wallDir);
+                BlockPos torchBlock = pos.up(dy);
+                if (mc.world.getBlockState(wallBlock).isSolidBlock(mc.world, wallBlock)
+                        && mc.world.getBlockState(torchBlock).isAir()) {
+                    if (placeTorch(mc, torchSlot, wallBlock, wallDir.getOpposite())) return;
+                }
+            }
+        }
+        // Floor fallback
+        BlockPos below = pos.down();
+        if (mc.world.getBlockState(below).isSolidBlock(mc.world, below) && mc.world.getBlockState(pos).isAir()) {
+            placeTorch(mc, torchSlot, below, Direction.UP);
+        }
+    }
+
+    private boolean placeTorch(MinecraftClient mc, int torchSlot, BlockPos target, Direction face) {
+        int prevSlot = mc.player.getInventory().selectedSlot;
+        mc.player.getInventory().selectedSlot = torchSlot;
+        Vec3d hitVec = Vec3d.ofCenter(target).add(Vec3d.of(face.getVector()).multiply(0.5));
+        BlockHitResult hit = new BlockHitResult(hitVec, face, target, false);
+        ActionResult result = mc.interactionManager.interactBlock(mc.player, Hand.MAIN_HAND, hit);
+        mc.player.swingHand(Hand.MAIN_HAND);
+        mc.player.getInventory().selectedSlot = prevSlot;
+        return result.isAccepted();
     }
 
     // ── Global Baritone settings (applied on start) ───────────────────────────
@@ -232,7 +298,7 @@ public class BotModule {
         waitForPlayer();
         MinecraftClient.getInstance().execute(() -> {
             BaritoneAPI.getSettings().allowBreak.value = true;
-            BaritoneAPI.getSettings().allowPlace.value = false;
+            BaritoneAPI.getSettings().allowPlace.value = true;
         });
 
         int cycle = 0;
@@ -287,7 +353,16 @@ public class BotModule {
         MinecraftClient mc = MinecraftClient.getInstance();
         mc.execute(() -> baritone().getExploreProcess()
             .explore(mc.player.getBlockX(), mc.player.getBlockZ()));
-        sleepSeconds(seconds);
+        for (int i = 0; i < seconds && running.get(); i++) {
+            Thread.sleep(1_000);
+            if (i % 10 == 9 && hasNearbyVillageBlocks()) {
+                log("§e[Bot] Village interior detected — breaking in");
+                cancelBaritone();
+                Thread.sleep(200);
+                mine(VILLAGE_BLOCKS, 8, 120);
+                return;
+            }
+        }
         cancelBaritone();
         Thread.sleep(300);
     }

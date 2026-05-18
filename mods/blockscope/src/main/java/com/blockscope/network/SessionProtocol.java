@@ -60,12 +60,23 @@ public class SessionProtocol {
 
                 if (baritonePresent) {
                     BotModule bot = BotModule.getInstance();
-                    if ("creative".equalsIgnoreCase(mode)) {
-                        if (bot.getMode() != BotModule.Mode.CREATIVE_SURVEY) bot.cycleMode();
+                    BotModule.Mode botMode = "creative".equalsIgnoreCase(mode)
+                        ? BotModule.Mode.CREATIVE_SURVEY
+                        : BotModule.Mode.SURVIVAL_GATHER;
+                    boolean wasRunning = bot.isRunning();
+                    if (wasRunning) bot.stop();
+                    bot.setMode(botMode);
+                    if (wasRunning) {
+                        // Baritone needs ~1.5s to fully tear down before we can restart cleanly
+                        Thread restartThread = new Thread(() -> {
+                            try { Thread.sleep(1500); } catch (InterruptedException ignored) {}
+                            client.execute(bot::start);
+                        }, "blockscope-bot-restart");
+                        restartThread.setDaemon(true);
+                        restartThread.start();
                     } else {
-                        if (bot.getMode() != BotModule.Mode.SURVIVAL_GATHER) bot.cycleMode();
+                        bot.start();
                     }
-                    if (!bot.isRunning()) bot.start();
                 }
 
                 if (replayMod != null && !replayMod.isRecording()) {
