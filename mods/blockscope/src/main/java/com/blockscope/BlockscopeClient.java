@@ -51,7 +51,8 @@ public class BlockscopeClient implements ClientModInitializer {
         SessionProtocol.registerClient(replayModIntegration);
 
         // Stop recording and bot immediately on disconnect so the server select /
-        // disconnect screen never leaks into the video.
+        // disconnect screen never leaks into the video. Then auto-reconnect if
+        // this was a managed session kicked by Lodestone.
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
             if (RecordingManager.getInstance().isRecording()) {
                 System.out.println("[Blockscope] Disconnect — stopping recording");
@@ -60,6 +61,7 @@ public class BlockscopeClient implements ClientModInitializer {
             if (baritonePresent && BotModule.getInstance().isRunning()) {
                 BotModule.getInstance().stop();
             }
+            SessionProtocol.onDisconnect(client);
         });
 
         recordingToggleKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(

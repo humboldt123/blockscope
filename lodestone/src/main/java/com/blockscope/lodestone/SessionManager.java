@@ -3,6 +3,7 @@ package com.blockscope.lodestone;
 import org.bukkit.*;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.entity.Player;
+import org.bukkit.generator.structure.Structure;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerJoinEvent;
@@ -169,38 +170,61 @@ public class SessionManager implements Listener {
     }
 
     /**
-     * Attempt to bias the spawn point.
-     * 1/5 → village, 1/5 → random interesting structure, 3/5 → leave vanilla spawn.
-     * Uses /locate equivalent via Paper's StructureSearchResult.
+     * Bias spawn point:
+     *   2/10 → old village (old_villages:village_plains)
+     *   5/10 → special structure, weighted heavily toward herobrine + shrines
+     *           (beta_world:shrines randomly picks diamondpillar or bedrock from its pool)
+     *   3/10 → default vanilla spawn
      */
     private void targetSpawn(World world) {
-        int roll = rng.nextInt(5);
-        if (roll == 0) {
-            locateAndSetSpawn(world, StructureType.VILLAGE);
-        } else if (roll == 1) {
-            StructureType[] candidates = {
-                StructureType.MINESHAFT,
-                StructureType.DESERT_PYRAMID,
-                StructureType.RUINED_PORTAL,
-                StructureType.SWAMP_HUT
+        int roll = rng.nextInt(10);
+        if (roll < 2) {
+            locateAndSetSpawn(world, "old_villages:village_plains");
+        } else if (roll < 7) {
+            // herobrine×3, shrines×3 (pool picks diamondpillar or bedrock), ruins×1, orewall×1
+            String[] weighted = {
+                "beta_world:herobrine", "beta_world:herobrine", "beta_world:herobrine",
+                "beta_world:shrines",   "beta_world:shrines",   "beta_world:shrines",
+                "beta_world:ruins",
+                "beta_world:orewall",
             };
-            locateAndSetSpawn(world, candidates[rng.nextInt(candidates.length)]);
+            locateAndSetSpawn(world, weighted[rng.nextInt(weighted.length)]);
         }
-        // else: leave spawn where vanilla placed it (3/5 of the time)
+        // else 3/10: leave vanilla spawn as-is
     }
 
-    private void locateAndSetSpawn(World world, StructureType type) {
+    private void locateAndSetSpawn(World world, String structureKey) {
         try {
+            NamespacedKey key = NamespacedKey.fromString(structureKey);
+            if (key == null) { plugin.getLogger().warning("Bad structure key: " + structureKey); return; }
+
+            Structure structure = Registry.STRUCTURE.get(key);
+            if (structure == null) {
+                StringBuilder sample = new StringBuilder("Structure not in registry: " + structureKey + " — known: ");
+                int n = 0;
+                for (Structure s : Registry.STRUCTURE) {
+                    if (n++ > 0) sample.append(", ");
+                    sample.append(s.getKey());
+                    if (n >= 5) { sample.append("…"); break; }
+                }
+                plugin.getLogger().warning(sample.toString());
+                return;
+            }
+
             Location origin = world.getSpawnLocation();
-            Location found = world.locateNearestStructure(origin, type, 200, false);
-            if (found != null) {
+            plugin.getLogger().info(world.getName() + ": searching for " + structureKey + " within 300 chunks...");
+            var result = world.locateNearestStructure(origin, structure, 300, false);
+            if (result != null) {
+                Location found = result.getLocation();
                 found.setY(world.getHighestBlockYAt(found.getBlockX(), found.getBlockZ()) + 1);
                 world.setSpawnLocation(found);
-                plugin.getLogger().info(world.getName() + ": spawn → " + type.getName() +
+                plugin.getLogger().info(world.getName() + ": spawn → " + structureKey +
                     " @ " + found.getBlockX() + "," + found.getBlockZ());
+            } else {
+                plugin.getLogger().info(world.getName() + ": " + structureKey + " not found within 300 chunks, keeping vanilla spawn");
             }
         } catch (Exception e) {
-            // Structure not found nearby — leave spawn as-is
+            plugin.getLogger().warning("locateAndSetSpawn(" + structureKey + ") threw: " + e);
         }
     }
 

@@ -23,6 +23,10 @@ public class Config {
     // Path to ffmpeg binary (GUI apps on Mac don't inherit shell PATH)
     public String ffmpegPath = "ffmpeg";
 
+    // Auto-reconnect after server kicks for session end
+    public boolean autoReconnect = true;
+    public int reconnectDelaySeconds = 3;
+
     // Phase 4: Entity capture settings
     public boolean captureNearbyEntities = true;
     public int entityCaptureRadius = 16;          // blocks (reduced from 32 for performance)
@@ -68,6 +72,8 @@ public class Config {
             // Upload server
             serverUrl = props.getProperty("server_url", "https://seattle-ferry-pam-acdbentity.trycloudflare.com");
             ffmpegPath = props.getProperty("ffmpeg_path", "ffmpeg");
+            autoReconnect = Boolean.parseBoolean(props.getProperty("auto_reconnect", "true"));
+            reconnectDelaySeconds = Integer.parseInt(props.getProperty("reconnect_delay_seconds", "3"));
 
             // Phase 4: Entity capture
             captureNearbyEntities = Boolean.parseBoolean(props.getProperty("capture_nearby_entities", "true"));
@@ -100,6 +106,8 @@ public class Config {
             // Upload server
             props.setProperty("server_url", serverUrl);
             props.setProperty("ffmpeg_path", ffmpegPath);
+            props.setProperty("auto_reconnect", String.valueOf(autoReconnect));
+            props.setProperty("reconnect_delay_seconds", String.valueOf(reconnectDelaySeconds));
 
             // Phase 4: Entity capture
             props.setProperty("capture_nearby_entities", String.valueOf(captureNearbyEntities));
