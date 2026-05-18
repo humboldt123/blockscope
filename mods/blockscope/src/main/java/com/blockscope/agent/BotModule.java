@@ -2,13 +2,13 @@ package com.blockscope.agent;
 
 import baritone.api.BaritoneAPI;
 import baritone.api.IBaritone;
-import baritone.api.pathing.goals.GoalXZ;
 import baritone.api.pathing.goals.GoalYLevel;
 import baritone.api.process.IBaritoneProcess;
 import net.minecraft.block.Block;
 import net.minecraft.block.Blocks;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.text.Text;
+import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3d;
 
 import java.util.Random;
@@ -162,6 +162,8 @@ public class BotModule {
             s.randomLooking113.value        = 0.10;
             s.freeLook.value                = false; // creative survey overrides this to true
 
+            // Doors: Baritone naturally opens doors when pathfinding through them.
+
             // Don't warp into nether portals during automated runs
             s.enterPortal.value             = false;
 
@@ -233,48 +235,32 @@ public class BotModule {
             BaritoneAPI.getSettings().allowPlace.value = false;
         });
 
-        giveStarterKit();
-        Thread.sleep(500);
-
         int cycle = 0;
         while (running.get()) {
             cycle++;
             log("§a[Bot] Survival cycle " + cycle);
 
-            // Long surface sweep — loads new terrain, finds villages, walks through doors
+            // Long surface sweep — loads new terrain, finds villages
             explore(150);
             if (!running.get()) break;
 
-            // Gather wood and surface ores while roaming
             mine(WOOD, 24, 180);
             if (!running.get()) break;
 
             mine(SURFACE_ORES, 16, 180);
             if (!running.get()) break;
 
-            // Seek village interiors — beds/bookshelves/pressure plates force the bot
-            // through doorways and into building interiors
-            mine(VILLAGE_BLOCKS, 12, 240);
-            if (!running.get()) break;
-
-            // Another surface wander so Baritone covers more ground before going under
-            explore(90);
-            if (!running.get()) break;
-
-            // Descend to ore level via cave passages where possible
+            // Descend underground
             log("§a[Bot] Descending underground…");
             descend(12, 150);
             if (!running.get()) break;
 
-            // Mine deep ores, naturally following cave systems
             mine(DEEP_ORES, 24, 360);
             if (!running.get()) break;
 
-            // Sweep cave passages at this level
             explore(120);
             if (!running.get()) break;
 
-            // Return to surface
             log("§a[Bot] Returning to surface…");
             descend(70, 150);
             if (!running.get()) break;
@@ -286,26 +272,6 @@ public class BotModule {
         MinecraftClient.getInstance().execute(() ->
             baritone().getCustomGoalProcess().setGoalAndPath(new GoalYLevel(targetY)));
         awaitProcess(baritone().getCustomGoalProcess(), maxSeconds);
-    }
-
-    /** Give the player a basic tool set via command so mining is actually efficient. */
-    private void giveStarterKit() {
-        String[] items = {
-            "minecraft:iron_pickaxe",
-            "minecraft:iron_axe",
-            "minecraft:iron_shovel",
-            "minecraft:iron_sword",
-            "minecraft:torch 32",
-            "minecraft:bread 16",
-        };
-        MinecraftClient mc = MinecraftClient.getInstance();
-        mc.execute(() -> {
-            if (mc.player == null) return;
-            for (String item : items) {
-                mc.player.networkHandler.sendChatCommand("give @s " + item);
-            }
-            log("§a[Bot] Starter kit given");
-        });
     }
 
     // ── Shared helpers ────────────────────────────────────────────────────────
@@ -326,11 +292,41 @@ public class BotModule {
         Thread.sleep(300);
     }
 
+    /**
+     * Wait for a Baritone process to finish, but every 10 seconds scan for nearby
+     * village interior blocks (beds, bookshelves, pressure plates). If found,
+     * cancel the current task and mine them — forcing the bot inside buildings —
+     * then hand control back to the caller.
+     */
     private void awaitProcess(IBaritoneProcess process, int maxSeconds) throws InterruptedException {
         for (int i = 0; i < maxSeconds * 2 && running.get(); i++) {
             Thread.sleep(500);
             if (!process.isActive()) return;
+            // Every 10 s check for village interior blocks within 24 blocks
+            if (i % 20 == 19 && hasNearbyVillageBlocks()) {
+                log("§e[Bot] Village interior detected — breaking in");
+                cancelBaritone();
+                Thread.sleep(200);
+                mine(VILLAGE_BLOCKS, 8, 120);
+                return; // caller's phase continues on next iteration
+            }
         }
+    }
+
+    /** Scan a 24-block radius for any VILLAGE_BLOCKS (beds, bookshelves, pressure plates). */
+    private boolean hasNearbyVillageBlocks() {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc.player == null || mc.world == null) return false;
+        int px = mc.player.getBlockX(), py = mc.player.getBlockY(), pz = mc.player.getBlockZ();
+        for (int dx = -24; dx <= 24; dx += 3) {
+            for (int dy = -4; dy <= 4; dy++) {
+                for (int dz = -24; dz <= 24; dz += 3) {
+                    Block b = mc.world.getBlockState(new BlockPos(px+dx, py+dy, pz+dz)).getBlock();
+                    for (Block vb : VILLAGE_BLOCKS) if (b == vb) return true;
+                }
+            }
+        }
+        return false;
     }
 
     private void sleepSeconds(int seconds) throws InterruptedException {
