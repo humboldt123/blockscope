@@ -35,14 +35,15 @@ public class SessionManager implements Listener {
     private final int sessionDurationSeconds;
     private final boolean toolRandomisation;
     private final int toolCheckIntervalTicks;
-    private final boolean creativeEnabled;
     private final boolean survivalEnabled;
+    private final boolean voidScatterEnabled;
     private final boolean baritoneControlEnabled;
 
     // Path to beta_world.zip — resolved relative to plugin data folder
     private File betaDatapackZip;
 
-    private final Queue<World> worldPool = new ConcurrentLinkedQueue<>();
+    private final Queue<World> survivalPool     = new ConcurrentLinkedQueue<>();
+    private final Queue<World> voidScatterPool  = new ConcurrentLinkedQueue<>();
     private final Map<UUID, World> playerWorlds = new ConcurrentHashMap<>();
     private final Map<UUID, Integer> toolCheckTasks = new ConcurrentHashMap<>();
     private final Map<UUID, Integer> sessionTimers = new ConcurrentHashMap<>();
@@ -55,7 +56,7 @@ public class SessionManager implements Listener {
         return t;
     });
 
-    private boolean nextCreative = true;
+    private int modeIndex = 0;
 
     public SessionManager(LodestonePlugin plugin) {
         this.plugin = plugin;
@@ -64,8 +65,8 @@ public class SessionManager implements Listener {
         this.sessionDurationSeconds = cfg.getInt("session_duration_seconds", 1800);
         this.toolRandomisation      = cfg.getBoolean("tool_randomisation_enabled", true);
         this.toolCheckIntervalTicks = cfg.getInt("tool_check_interval_seconds", 30) * 20;
-        this.creativeEnabled        = cfg.getBoolean("creative_sessions_enabled", true);
         this.survivalEnabled        = cfg.getBoolean("survival_sessions_enabled", true);
+        this.voidScatterEnabled     = cfg.getBoolean("void_scatter_sessions_enabled", true);
         this.baritoneControlEnabled = cfg.getBoolean("baritone_control_enabled", true);
 
         // Look for beta_world.zip next to the plugin jar (in plugins/ folder)
@@ -116,11 +117,22 @@ public class SessionManager implements Listener {
 
     private void refillPool() {
         bgPool.submit(() -> {
-            while (worldPool.size() < poolSize) {
-                World w = generateWorld();
-                if (w != null) {
-                    worldPool.add(w);
-                    plugin.getLogger().info("World pool: ready world added (" + w.getName() + "), pool size=" + worldPool.size());
+            if (survivalEnabled) {
+                while (survivalPool.size() < poolSize) {
+                    World w = generateWorld();
+                    if (w != null) {
+                        survivalPool.add(w);
+                        plugin.getLogger().info("World pool: survival world ready (" + w.getName() + "), pool size=" + survivalPool.size());
+                    }
+                }
+            }
+            if (voidScatterEnabled) {
+                while (voidScatterPool.size() < poolSize) {
+                    World w = generateVoidWorldFromBg();
+                    if (w != null) {
+                        voidScatterPool.add(w);
+                        plugin.getLogger().info("World pool: void scatter world ready (" + w.getName() + "), pool size=" + voidScatterPool.size());
+                    }
                 }
             }
         });
@@ -235,10 +247,14 @@ public class SessionManager implements Listener {
         Player player = event.getPlayer();
         event.joinMessage(null);
 
-        World world = worldPool.poll();
+        String modeStr = assignMode();
+        boolean isVoidScatter = "void_scatter".equals(modeStr);
+
+        Queue<World> pool = isVoidScatter ? voidScatterPool : survivalPool;
+        World world = pool.poll();
         if (world == null) {
             plugin.getLogger().warning("World pool empty — generating on-demand for " + player.getName());
-            world = generateWorldSync();
+            world = isVoidScatter ? generateVoidWorldSync() : generateWorldSync();
         }
         if (world == null) {
             player.kick(net.kyori.adventure.text.Component.text("§cFailed to create session world. Try again in a moment."));
@@ -249,17 +265,16 @@ public class SessionManager implements Listener {
         playerWorlds.put(player.getUniqueId(), world);
         refillPool();
 
-        boolean creative = assignCreative();
-        String modeStr = creative ? "creative" : "survival";
         World finalWorld = world;
 
         Bukkit.getScheduler().runTask(plugin, () -> {
-            // Clear inventory and apply gamemode before teleport
             player.getInventory().clear();
-            player.setGameMode(creative ? GameMode.CREATIVE : GameMode.SURVIVAL);
+            player.setGameMode(GameMode.SURVIVAL);
             player.teleport(finalWorld.getSpawnLocation());
 
-            if (!creative && toolRandomisation) {
+            if (isVoidScatter) {
+                giveScatterInventory(player);
+            } else if (toolRandomisation) {
                 giveRandomTools(player);
                 scheduleToolCheck(player);
             }
@@ -369,15 +384,78 @@ public class SessionManager implements Listener {
 
     // ── Helpers ────────────────────────────────────────────────────────────────
 
-    private boolean assignCreative() {
-        if (creativeEnabled && !survivalEnabled) return true;
-        if (survivalEnabled && !creativeEnabled) return false;
-        boolean c = nextCreative;
-        nextCreative = !nextCreative;
-        return c;
+    private String assignMode() {
+        java.util.List<String> modes = new java.util.ArrayList<>();
+        if (survivalEnabled)    modes.add("survival");
+        if (voidScatterEnabled) modes.add("void_scatter");
+        if (modes.isEmpty())    return "survival";
+        return modes.get((modeIndex++) % modes.size());
+    }
+
+    /** Called from bgPool thread — dispatches createWorld() to main thread then waits. */
+    private World generateVoidWorldFromBg() {
+        String name = "bs_" + worldCounter.incrementAndGet() + "_" + Long.toHexString(rng.nextLong() & 0xFFFFFFL);
+        CompletableFuture<World> future = new CompletableFuture<>();
+        Bukkit.getScheduler().runTask(plugin, () -> {
+            try {
+                World w = new WorldCreator(name)
+                    .environment(World.Environment.NORMAL)
+                    .generator(new VoidScatterGenerator())
+                    .generateStructures(false)
+                    .createWorld();
+                if (w != null) applyVoidWorldRules(w);
+                future.complete(w);
+            } catch (Exception e) {
+                plugin.getLogger().severe("Void world creation failed: " + e.getMessage());
+                future.complete(null);
+            }
+        });
+        try { return future.get(60, TimeUnit.SECONDS); } catch (Exception e) { return null; }
+    }
+
+    /** Called from main thread (on-demand fallback during onPlayerJoin). */
+    private World generateVoidWorldSync() {
+        String name = "bs_" + worldCounter.incrementAndGet() + "_" + Long.toHexString(rng.nextLong() & 0xFFFFFFL);
+        try {
+            World w = new WorldCreator(name)
+                .environment(World.Environment.NORMAL)
+                .generator(new VoidScatterGenerator())
+                .generateStructures(false)
+                .createWorld();
+            if (w != null) applyVoidWorldRules(w);
+            return w;
+        } catch (Exception e) {
+            plugin.getLogger().severe("Void world creation failed: " + e.getMessage());
+            return null;
+        }
+    }
+
+    private void applyVoidWorldRules(World w) {
+        w.setDifficulty(Difficulty.PEACEFUL);
+        w.setGameRule(GameRule.DO_MOB_SPAWNING, false);
+        w.setGameRule(GameRule.DO_DAYLIGHT_CYCLE, true);
+        w.setGameRule(GameRule.ANNOUNCE_ADVANCEMENTS, false);
+        w.setGameRule(GameRule.SHOW_DEATH_MESSAGES, false);
+        w.setGameRule(GameRule.DO_IMMEDIATE_RESPAWN, true);
+    }
+
+    private void giveScatterInventory(Player player) {
+        Material[] pool = VoidScatterGenerator.SCATTER_MATERIALS;
+        // Fill hotbar (9 slots) with random distinct block types, 64 each
+        java.util.List<Material> chosen = new java.util.ArrayList<>();
+        java.util.List<Material> shuffled = new java.util.ArrayList<>(java.util.Arrays.asList(pool));
+        java.util.Collections.shuffle(shuffled, rng);
+        for (Material m : shuffled) {
+            if (chosen.size() >= 9) break;
+            chosen.add(m);
+        }
+        for (int i = 0; i < chosen.size(); i++) {
+            player.getInventory().setItem(i, new ItemStack(chosen.get(i), 64));
+        }
     }
 
     private World generateWorldSync() {
+        // on-demand fallback for survival — runs generateWorld() on bgPool (it uses runTask internally)
         CompletableFuture<World> f = new CompletableFuture<>();
         bgPool.submit(() -> f.complete(generateWorld()));
         try { return f.get(120, TimeUnit.SECONDS); } catch (Exception e) { return null; }
@@ -396,7 +474,9 @@ public class SessionManager implements Listener {
     public void shutdown() {
         plugin.getServer().getMessenger().unregisterOutgoingPluginChannel(plugin, SESSION_CHANNEL);
         bgPool.shutdownNow();
-        for (World w : worldPool) unloadAndDeleteWorld(w);
-        worldPool.clear();
+        for (World w : survivalPool)    unloadAndDeleteWorld(w);
+        for (World w : voidScatterPool) unloadAndDeleteWorld(w);
+        survivalPool.clear();
+        voidScatterPool.clear();
     }
 }

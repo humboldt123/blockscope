@@ -2,6 +2,8 @@ package com.blockscope.agent;
 
 import baritone.api.BaritoneAPI;
 import baritone.api.IBaritone;
+import baritone.api.pathing.goals.GoalBlock;
+import baritone.api.pathing.goals.GoalXZ;
 import baritone.api.pathing.goals.GoalYLevel;
 import baritone.api.process.IBaritoneProcess;
 import net.minecraft.block.Block;
@@ -28,12 +30,16 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *
  *   SURVIVAL_GATHER  — cycles: chop wood → surface ores → explore → deep ores.
  *
+ *   VOID_SCATTER     — void world seeded with random known blocks; every 30 s
+ *                      Baritone pathfinds to a random scatter block, scaffolding
+ *                      with the stacks of blocks in inventory.
+ *
  * Toggle with G.  Cycle modes (while stopped) with H.
  * Requires baritone-api-fabric-1.9.5.jar in mods folder.
  */
 public class BotModule {
 
-    public enum Mode { CREATIVE_SURVEY, SURVIVAL_GATHER }
+    public enum Mode { CREATIVE_SURVEY, SURVIVAL_GATHER, VOID_SCATTER }
 
     private static BotModule instance;
     private final AtomicBoolean running = new AtomicBoolean(false);
@@ -80,6 +86,7 @@ public class BotModule {
         botThread = new Thread(() -> {
             try {
                 if (mode == Mode.CREATIVE_SURVEY) runCreativeSurvey();
+                else if (mode == Mode.VOID_SCATTER) runVoidScatter();
                 else runSurvivalGather();
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -293,6 +300,87 @@ public class BotModule {
         Blocks.IRON_ORE, Blocks.GOLD_ORE, Blocks.REDSTONE_ORE,
         Blocks.LAPIS_ORE, Blocks.DIAMOND_ORE,
     };
+
+    // ── Void scatter ──────────────────────────────────────────────────────────
+
+    // Mirror of VoidScatterGenerator.SCATTER_MATERIALS (Java server) and
+    // block_vocab.py :: SCATTER_BLOCKS (Python pipeline).
+    private static final Block[] VOID_SCATTER_BLOCKS = {
+        Blocks.STONE, Blocks.COBBLESTONE, Blocks.DIRT, Blocks.GRASS_BLOCK,
+        Blocks.SAND, Blocks.GRAVEL, Blocks.CLAY, Blocks.SANDSTONE,
+        Blocks.MOSSY_COBBLESTONE, Blocks.STONE_BRICKS, Blocks.BRICKS, Blocks.OBSIDIAN,
+        Blocks.COARSE_DIRT, Blocks.PACKED_ICE, Blocks.SNOW_BLOCK,
+        Blocks.COAL_ORE, Blocks.IRON_ORE, Blocks.GOLD_ORE, Blocks.DIAMOND_ORE,
+        Blocks.LAPIS_ORE, Blocks.REDSTONE_ORE, Blocks.EMERALD_ORE,
+        Blocks.COAL_BLOCK, Blocks.IRON_BLOCK, Blocks.GOLD_BLOCK,
+        Blocks.DIAMOND_BLOCK, Blocks.LAPIS_BLOCK, Blocks.EMERALD_BLOCK,
+        Blocks.OAK_LOG, Blocks.OAK_PLANKS, Blocks.OAK_LEAVES, Blocks.BOOKSHELF,
+        Blocks.WHITE_WOOL, Blocks.ORANGE_WOOL, Blocks.MAGENTA_WOOL, Blocks.LIGHT_BLUE_WOOL,
+        Blocks.YELLOW_WOOL, Blocks.LIME_WOOL, Blocks.PINK_WOOL, Blocks.GRAY_WOOL,
+        Blocks.LIGHT_GRAY_WOOL, Blocks.CYAN_WOOL, Blocks.PURPLE_WOOL, Blocks.BLUE_WOOL,
+        Blocks.BROWN_WOOL, Blocks.GREEN_WOOL, Blocks.RED_WOOL, Blocks.BLACK_WOOL,
+        Blocks.TERRACOTTA,
+        Blocks.WHITE_TERRACOTTA, Blocks.ORANGE_TERRACOTTA, Blocks.YELLOW_TERRACOTTA,
+        Blocks.RED_TERRACOTTA, Blocks.BROWN_TERRACOTTA, Blocks.GREEN_TERRACOTTA,
+        Blocks.GRAY_TERRACOTTA, Blocks.CYAN_TERRACOTTA,
+        Blocks.HAY_BLOCK, Blocks.PUMPKIN, Blocks.MELON,
+        Blocks.BROWN_MUSHROOM_BLOCK, Blocks.RED_MUSHROOM_BLOCK, Blocks.MUSHROOM_STEM,
+        Blocks.GLASS,
+        Blocks.WHITE_STAINED_GLASS, Blocks.ORANGE_STAINED_GLASS, Blocks.RED_STAINED_GLASS,
+        Blocks.BLUE_STAINED_GLASS, Blocks.GREEN_STAINED_GLASS, Blocks.YELLOW_STAINED_GLASS,
+        Blocks.CRAFTING_TABLE, Blocks.CHEST, Blocks.FURNACE,
+        Blocks.NETHERRACK,
+    };
+
+    private void runVoidScatter() throws InterruptedException {
+        waitForPlayer();
+        MinecraftClient.getInstance().execute(() -> {
+            var s = BaritoneAPI.getSettings();
+            s.allowBreak.value         = true;
+            s.allowPlace.value         = true;
+            s.allowParkour.value       = false;
+            s.allowParkourPlace.value  = false;
+            s.allowParkourAscend.value = false;
+            // Let Baritone scaffold with any block in the void scatter inventory
+            java.util.List<net.minecraft.item.Item> throwaway = new java.util.ArrayList<>();
+            for (Block b : VOID_SCATTER_BLOCKS) {
+                net.minecraft.item.Item item = b.asItem();
+                if (item != net.minecraft.item.Items.AIR) throwaway.add(item);
+            }
+            s.acceptableThrowawayItems.value = throwaway;
+        });
+
+        int step = 0;
+        while (running.get()) {
+            if (step % 5 == 4) {
+                MinecraftClient mc = MinecraftClient.getInstance();
+                if (mc.player != null) {
+                    int y = 10 + rng.nextInt(100);
+                    log("§d[Bot] Void ↕ y=" + y);
+                    mc.execute(() -> baritone().getCustomGoalProcess()
+                        .setGoalAndPath(new GoalYLevel(y)));
+                    awaitProcess(baritone().getCustomGoalProcess(), 20);
+                    // Brief pause after Y goal (success or failure) before next phase
+                    Thread.sleep(5_000);
+                }
+            } else {
+                exploreVoid(40);
+            }
+            step++;
+        }
+    }
+
+    private void exploreVoid(int seconds) throws InterruptedException {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc.player == null) { Thread.sleep(1000); return; }
+        mc.execute(() -> baritone().getExploreProcess()
+            .explore(mc.player.getBlockX(), mc.player.getBlockZ()));
+        for (int i = 0; i < seconds && running.get(); i++) {
+            Thread.sleep(1_000);
+        }
+        cancelBaritone();
+        Thread.sleep(300);
+    }
 
     private void runSurvivalGather() throws InterruptedException {
         waitForPlayer();

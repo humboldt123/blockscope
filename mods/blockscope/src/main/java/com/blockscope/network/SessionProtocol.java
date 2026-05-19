@@ -60,9 +60,9 @@ public class SessionProtocol {
 
                 if (baritonePresent) {
                     BotModule bot = BotModule.getInstance();
-                    BotModule.Mode botMode = "creative".equalsIgnoreCase(mode)
-                        ? BotModule.Mode.CREATIVE_SURVEY
-                        : BotModule.Mode.SURVIVAL_GATHER;
+                    BotModule.Mode botMode = "creative".equalsIgnoreCase(mode)     ? BotModule.Mode.CREATIVE_SURVEY
+                                           : "void_scatter".equalsIgnoreCase(mode) ? BotModule.Mode.VOID_SCATTER
+                                           :                                          BotModule.Mode.SURVIVAL_GATHER;
                     boolean wasRunning = bot.isRunning();
                     if (wasRunning) bot.stop();
                     bot.setMode(botMode);

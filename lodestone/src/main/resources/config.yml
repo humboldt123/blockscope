@@ -1,6 +1,6 @@
 baritone_control_enabled: true
-creative_sessions_enabled: true
 survival_sessions_enabled: true
+void_scatter_sessions_enabled: true
 session_duration_seconds: 1800
 tool_randomisation_enabled: true
 tool_check_interval_seconds: 30
