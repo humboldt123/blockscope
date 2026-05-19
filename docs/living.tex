@@ -729,17 +729,17 @@ Whether to model block-state combinations jointly (one classification target per
 
 \subsection{Mod-Collected Data (Primary)}
 
-Blockscope is a client-side Fabric 1.19.4 mod that records gameplay by running alongside ReplayMod as a companion recorder. No Minecraft server modifications are required. Three components run simultaneously on the player's machine:
+Blockscope is a client-side Fabric 1.19.4 mod that records gameplay by running alongside ReplayMod as a companion recorder. A companion server-side Paper plugin (Lodestone) manages session assignment, world lifecycle, and sends the \texttt{blockscope:session\_start} plugin message; it is required for automated multi-session collection but not for manual single-player recording. Three components run simultaneously on the player's machine:
 
 \begin{itemize}
   \item \textbf{Blockscope mod.} Polls ReplayMod's recording state each client tick and collects per-tick metadata (player state, camera state, inventory, world state, GUI state, crosshair target). An \texttt{AsyncWriter} queues the JSON and POSTs it in batches to Hopper in real time. A \texttt{SegmentedTSEncoder} captures the rendered framebuffer at 20\,fps, encodes to MPEG-TS segments, and uploads each segment as it completes. The recording toggle is bound to a key (default R); a Mixin on \texttt{MinecraftClient.render()} captures frames after all GUI drawing (including open inventories) so the recorded video includes in-game screens.
 
   \item \textbf{ReplayMod companion.} ReplayMod (1.19.4-2.6.20, \texttt{modCompileOnly} dependency) records all raw Minecraft 1.19.4 protocol packets to a \texttt{.mcpr} file during the session. The \texttt{.mcpr} is a zip containing a binary packet stream of \texttt{(timestamp\_ms, length, data)} tuples; it is uploaded to Hopper when the player exits the world. Block-state grids (\texttt{b}), visibility masks (\texttt{m}), and seen-before masks (\texttt{s}) are derived from the \texttt{.mcpr} in post-processing via world reconstruction from chunk packets and view-frustum ray-casting --- they are not collected in-mod.
 
-  \item \textbf{Hopper.} A FastAPI (Python) server receives streamed tick data, video segments, inputs, and the \texttt{.mcpr} over HTTP and writes them to a per-session folder. Currently runs locally on the recording machine; intended for deployment to a dedicated server for multi-player collection.
+  \item \textbf{Hopper.} A FastAPI (Python) server receives streamed tick data, video segments, inputs, and the \texttt{.mcpr} over HTTP and writes them to a per-session folder. Runs on the same VPS as Lodestone for multi-client collection.
 \end{itemize}
 
-\textbf{Status (2026-05-05):} The full pipeline is end-to-end functional: sessions produce complete output (video, tick data, \texttt{.mcpr}, inputs, frame mapping), post-processing to per-tick \texttt{.npz} files has been validated on real session data, and Hopper is running locally on the recording machine. Stress testing under deliberate multi-player breakage attempts (concurrent sessions, abrupt disconnects, edge-case tick scenarios) has not yet been conducted; deployment to a dedicated server and data collection at scale begins once this is complete.
+\textbf{Status (2026-05-19):} The full pipeline is end-to-end functional. Lodestone is deployed on a VPS at \texttt{mc.vivime.info} (port 25566), accessible directly over TCP with no client-side tunneling required. Sessions are assigned automatically on join: each client gets an isolated private world, the bot (Baritone) runs autonomously, and recordings upload to Hopper over HTTP. Active collection is underway in the limited-block-palette configuration described below. Hermitcraft-style and large random-world collection is deferred until the block-recognition heads are validated on palette data.
 
 \textbf{Session folder on Hopper:}
 
@@ -832,11 +832,16 @@ Field & Type & Description \\
 \textbf{Record \texttt{debugScreenVisible} flag (2025-05-04).} F3 visibility provides supervision for visual yaw recovery: when F3 is open, the visible-block stream contains numeric coordinates that the model can learn to read and align with the true yaw label from the pose field. This is a free auxiliary signal for the orientation-recovery learning task forced by the no-privileged-input constraint (Section~\ref{sec:nopriv}).
 \end{designdecision}
 
-\textbf{Data collection environments:}
+\textbf{Data collection environments (current and planned):}
 
 \begin{itemize}
-  \item \textbf{Hermitcraft-style servers.} High-skill, late-game, diverse play. Covers complex builds, redstone, large-scale resource gathering. VPT contractor data is almost exclusively early-game survival; this directly addresses that gap.
-  \item \textbf{Random generated worlds.} Systematically varies biomes, terrain types, and block distributions. Combined with the random block worlds used for the block tokenizer.
+  \item \textbf{Limited-block-palette survival (active).} Standard beta-terrain survival worlds. Bot cycles through wood gathering, ore mining, and surface exploration with Baritone. All sessions use a curated \textasciitilde{}80-block palette (the \texttt{KNOWN} vocabulary subset) so every collected frame contributes to block-recognition training on blocks the model will actually be evaluated on.
+
+  \item \textbf{Limited-block-palette void scatter (active).} Void worlds with \textasciitilde{}80 palette blocks scattered uniformly at 1.5\% density across $y=0$--$128$. Bot receives a hotbar of 9 random palette block stacks and uses Baritone's explore process to navigate, scaffolding with inventory blocks. Provides dense, controlled block-recognition signal with minimal terrain bias.
+
+  \item \textbf{Hermitcraft-style servers (deferred).} High-skill, late-game, diverse play. Covers complex builds, redstone, large-scale resource gathering. Deferred until block-recognition heads are validated on palette data.
+
+  \item \textbf{Random generated worlds (deferred).} Systematically varies biomes, terrain types, and block distributions. Combined with the random block worlds used for the block tokenizer. Deferred for the same reason.
 \end{itemize}
 
 \subsection{Post-Processing Pipeline}
@@ -858,7 +863,7 @@ Output is one \texttt{tick\_NNNNN.npz} per tick, containing \texttt{b}, \texttt{
 
 \textbf{Limitations:} Predominantly early-game survival. No per-slot inventory ground truth. No block ground truth. No pose beyond what can be inferred from the video.
 
-Use cases: action imitation pretraining (when action head is added); visual pretraining signal for SigLIP fine-tuning; background distribution for inventory bag-of-items prediction.
+\textbf{Note (2026-05-19):} VPT data was used in prior inventory-head experiments (EXP1 and the preceding dropper project). It is not the primary data source for the current collection phase, which uses mod-collected limited-palette sessions for full ground-truth block labels. VPT remains relevant for action imitation pretraining once the action head is added, and as a background distribution reference for inventory bag-of-items prediction.
 
 \subsection{Synthetic Inventory Data}
 

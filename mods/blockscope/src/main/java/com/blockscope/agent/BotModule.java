@@ -334,6 +334,8 @@ public class BotModule {
 
     private void runVoidScatter() throws InterruptedException {
         waitForPlayer();
+        // Baritone resets its settings on new server connection — wait for that to fire first
+        Thread.sleep(3000);
         MinecraftClient.getInstance().execute(() -> {
             var s = BaritoneAPI.getSettings();
             s.allowBreak.value         = true;

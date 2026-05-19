@@ -580,6 +580,17 @@ public class RecordingManager {
             System.out.println("[Blockscope] .mcpr upload complete");
             mcprUploaded = true;
             conn.disconnect();
+            final File toDelete = target;
+            Thread deleter = new Thread(() -> {
+                try { Thread.sleep(5000); } catch (InterruptedException ignored) {}
+                if (toDelete.delete()) {
+                    System.out.println("[Blockscope] Deleted local .mcpr: " + toDelete.getName());
+                } else {
+                    System.err.println("[Blockscope] Could not delete .mcpr: " + toDelete.getName());
+                }
+            }, "blockscope-mcpr-deleter");
+            deleter.setDaemon(true);
+            deleter.start();
             return true;
         } catch (Exception e) {
             System.err.println("[Blockscope] Failed to upload .mcpr: " + e.getMessage());

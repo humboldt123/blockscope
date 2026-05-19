@@ -8,6 +8,7 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.event.world.WorldInitEvent;
 import org.bukkit.inventory.ItemStack;
 
 import java.io.*;
@@ -158,12 +159,12 @@ public class SessionManager implements Listener {
                     w.setGameRule(GameRule.ANNOUNCE_ADVANCEMENTS, false);
                     w.setGameRule(GameRule.SHOW_DEATH_MESSAGES, false);
                     w.setGameRule(GameRule.DO_IMMEDIATE_RESPAWN, true);
-                    // Pre-load a small area around spawn
-                    Location spawn = w.getSpawnLocation();
-                    for (int dx = -1; dx <= 1; dx++) for (int dz = -1; dz <= 1; dz++) {
-                        w.getChunkAt(spawn.getBlockX() / 16 + dx, spawn.getBlockZ() / 16 + dz).load(true);
-                    }
-                    // 1/5 chance: relocate spawn to a village; 1/5: other structure; 3/5: leave it
+                    // WorldInitEvent set spawn to (0,64,0) as a placeholder to skip
+                    // Paper's expensive setInitialSpawn spiral scan. Now that createWorld()
+                    // has returned, chunk (0,0) is loaded — correct Y to actual surface.
+                    int surfaceY = w.getHighestBlockYAt(0, 0) + 1;
+                    w.setSpawnLocation(0, surfaceY, 0);
+                    // 2/10: village  5/10: beta structure  3/10: leave at origin surface
                     targetSpawn(w);
                 }
                 future.complete(w);
@@ -224,8 +225,8 @@ public class SessionManager implements Listener {
             }
 
             Location origin = world.getSpawnLocation();
-            plugin.getLogger().info(world.getName() + ": searching for " + structureKey + " within 300 chunks...");
-            var result = world.locateNearestStructure(origin, structure, 300, false);
+            plugin.getLogger().info(world.getName() + ": searching for " + structureKey + " within 50 chunks...");
+            var result = world.locateNearestStructure(origin, structure, 50, false);
             if (result != null) {
                 Location found = result.getLocation();
                 found.setY(world.getHighestBlockYAt(found.getBlockX(), found.getBlockZ()) + 1);
@@ -233,7 +234,7 @@ public class SessionManager implements Listener {
                 plugin.getLogger().info(world.getName() + ": spawn → " + structureKey +
                     " @ " + found.getBlockX() + "," + found.getBlockZ());
             } else {
-                plugin.getLogger().info(world.getName() + ": " + structureKey + " not found within 300 chunks, keeping vanilla spawn");
+                plugin.getLogger().info(world.getName() + ": " + structureKey + " not found within 50 chunks, keeping vanilla spawn");
             }
         } catch (Exception e) {
             plugin.getLogger().warning("locateAndSetSpawn(" + structureKey + ") threw: " + e);
@@ -241,6 +242,17 @@ public class SessionManager implements Listener {
     }
 
     // ── Player join / quit ─────────────────────────────────────────────────────
+
+    /**
+     * Fires before Paper's setInitialSpawn() runs. Setting spawn here marks it as
+     * "already set" so Paper skips the expensive chunk-scan for a valid spawn point.
+     */
+    @EventHandler
+    public void onWorldInit(WorldInitEvent event) {
+        if (event.getWorld().getName().startsWith("bs_")) {
+            event.getWorld().setSpawnLocation(0, 64, 0);
+        }
+    }
 
     @EventHandler
     public void onPlayerJoin(PlayerJoinEvent event) {
