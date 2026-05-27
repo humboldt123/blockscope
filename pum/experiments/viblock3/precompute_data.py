@@ -55,10 +55,12 @@ def get_valid_frame_ticks(session: str, tick_indices: np.ndarray) -> set[int]:
     return valid
 
 
+VB2_STEM = "viblock2_data.npz"
+
+
 def precompute_session(session: str, force: bool = False) -> bool:
     labels     = SMELTED_ROOT / session / "labels"
     out_path   = labels / STEM
-    vis_path   = labels / VIS_STEM
     ws_path    = labels / "world_states.bin"
     ticks_path = RAW_ROOT / session / "ticks.jsonl"
 
@@ -66,19 +68,34 @@ def precompute_session(session: str, force: bool = False) -> bool:
         log.info("skip %s (exists)", session)
         return True
 
-    for p in (vis_path, ws_path, ticks_path):
+    for p in (ws_path, ticks_path):
         if not p.exists():
             log.warning("skip %s (missing %s)", session, p.name)
             return False
 
-    vis_data     = np.load(vis_path)
-    tick_indices = vis_data["tick_indices"]
+    # Prefer viblock2_data.npz tick_indices (already valid-frame-filtered, fast).
+    # Fall back to visibility_s20.npz + full video scan if viblock2 data is absent.
+    vb2_path = labels / VB2_STEM
+    vis_path = labels / VIS_STEM
+    if vb2_path.exists():
+        tick_indices = np.load(vb2_path)["tick_indices"]
+        log.info("%s: using %d viblock2 tick indices (pre-filtered)", session, len(tick_indices))
+        need_video_scan = False
+    elif vis_path.exists():
+        tick_indices    = np.load(vis_path)["tick_indices"]
+        need_video_scan = True
+    else:
+        log.warning("skip %s (no tick index source)", session)
+        return False
 
     with open(ticks_path) as f:
         ticks = [json.loads(line) for line in f]
 
-    valid_frame_ticks = get_valid_frame_ticks(session, tick_indices)
-    log.info("%s: %d/%d ticks have valid frames", session, len(valid_frame_ticks), len(tick_indices))
+    if need_video_scan:
+        valid_frame_ticks = get_valid_frame_ticks(session, tick_indices)
+        log.info("%s: %d/%d ticks have valid frames", session, len(valid_frame_ticks), len(tick_indices))
+    else:
+        valid_frame_ticks = set(int(x) for x in tick_indices)
 
     valid_tick_indices = []
     valid_yaws         = []
