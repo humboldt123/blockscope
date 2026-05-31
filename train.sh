@@ -39,6 +39,7 @@ MASTER_PORT="${MASTER_PORT:-29500}"
 UNFREEZE_N="${UNFREEZE_N:-2}"
 HEAD_LR="${HEAD_LR:-1e-4}"
 BACKBONE_LR="${BACKBONE_LR:-1e-5}"
+INJECT_AT="${INJECT_AT:-10}"
 
 # Extra args forwarded verbatim to the training script
 EXTRA_ARGS="${EXTRA_ARGS:-}"
@@ -58,6 +59,9 @@ fi
 FINETUNE_TAG=""
 if [ "${SCRIPT}" = "train_finetune.py" ]; then
     FINETUNE_TAG="__unfrz${UNFREEZE_N}__hlr${HEAD_LR}__blr${BACKBONE_LR}"
+    if [ "${EXPERIMENT}" = "viblock4" ]; then
+        FINETUNE_TAG="${FINETUNE_TAG}__inj${INJECT_AT}"
+    fi
 fi
 
 RUN_NAME="${EXP_NAME}__${GPU_TAG}${FINETUNE_TAG}__e${EPOCHS}__${TIMESTAMP}__${GIT_SHA}"
@@ -99,6 +103,9 @@ if [ "${SCRIPT}" = "train_finetune.py" ]; then
         --head_lr     "${HEAD_LR}"
         --backbone_lr "${BACKBONE_LR}"
     )
+    if [ "${EXPERIMENT}" = "viblock4" ]; then
+        COMMON_ARGS+=(--inject_at "${INJECT_AT}")
+    fi
 fi
 
 # shellcheck disable=SC2206
