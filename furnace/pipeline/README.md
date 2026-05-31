@@ -1,4 +1,4 @@
-# furnace/pipeline
+# pum — furnace/pipeline
 
 GPU-based Minecraft 1.19.4 block visibility labeler. Replaces the V1 raycaster in `furnace/pipeline/` which was fundamentally broken (inverted visibility — marked visible blocks as invisible and vice versa).
 

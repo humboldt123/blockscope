@@ -1,5 +1,5 @@
 [project]
-name = "blockscope-pipeline"
+name = "pum-pipeline"
 version = "0.2.0"
 description = "Blockscope pipeline — GPU-based Minecraft block visibility labeler."
 requires-python = ">=3.12"
