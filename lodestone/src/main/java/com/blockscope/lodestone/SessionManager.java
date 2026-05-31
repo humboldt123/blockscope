@@ -159,6 +159,7 @@ public class SessionManager implements Listener {
                     w.setGameRule(GameRule.ANNOUNCE_ADVANCEMENTS, false);
                     w.setGameRule(GameRule.SHOW_DEATH_MESSAGES, false);
                     w.setGameRule(GameRule.DO_IMMEDIATE_RESPAWN, true);
+                    w.setTime(6000);
                     // WorldInitEvent set spawn to (0,64,0) as a placeholder to skip
                     // Paper's expensive setInitialSpawn spiral scan. Now that createWorld()
                     // has returned, chunk (0,0) is loaded — correct Y to actual surface.
@@ -446,6 +447,7 @@ public class SessionManager implements Listener {
         w.setDifficulty(Difficulty.PEACEFUL);
         w.setGameRule(GameRule.DO_MOB_SPAWNING, false);
         w.setGameRule(GameRule.DO_DAYLIGHT_CYCLE, true);
+        w.setTime(6000);
         w.setGameRule(GameRule.ANNOUNCE_ADVANCEMENTS, false);
         w.setGameRule(GameRule.SHOW_DEATH_MESSAGES, false);
         w.setGameRule(GameRule.DO_IMMEDIATE_RESPAWN, true);
