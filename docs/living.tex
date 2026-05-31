@@ -231,6 +231,10 @@ The patch tokens are projected to $d = 1536$:
 
 \subsection{Grid Memory Encoder}
 
+\begin{designdecision}
+\textbf{Tokenizer-based grid memory encoder deferred (2026-05-28).} The FSQ tokenizer described in Section~\ref{sec:tokenizer} was prototyped and found structurally broken (see that section for details). More importantly, viblock3 and viblock4 experiments (Section~\ref{sec:experiments}) demonstrated that predicting a full $32^3$ voxel grid \emph{directly} from a single image frame is achievable without any compression bottleneck: viblock4 reached occ\_iou=0.7635. Direct prediction does not require a tokenizer, has lower inference latency, and eliminates the frozen-encoder failure modes. The grid memory encoder and its recurrence loop are therefore deferred to a later stage, to be revisited only when the direct-prediction approach's capacity genuinely saturates and a compression stage becomes necessary. The description below reflects the originally planned architecture for completeness; it is not currently implemented.
+\end{designdecision}
+
 The grid encoder is a multi-scale residual finite-scalar quantization (FSQ) tokenizer. It is dedicated enough machinery that it has its own section --- see Section~\ref{sec:tokenizer}. Briefly:
 
 \[
@@ -540,6 +544,16 @@ Optimal $\lambda$ values and whether they should be scheduled (e.g.\ ramp $\lamb
 \label{sec:tokenizer}
 %% ============================================================
 
+\begin{designdecision}
+\textbf{3D scene tokenizer abandoned (2026-05-28).} The multi-scale residual FSQ tokenizer described in this section was built and trained. It failed all ship criteria at epoch 10: reconstruction mIoU = 9.9\% (target $\geq$75\%), cycle accuracy = 12.6\% (target $\geq$95\%), latency = 7.1\,ms (target $<$3\,ms). The failure is structural: residual magnitude decay in stacked FSQ causes fine-scale codebooks to be nearly permanently idle (2--4 active codes at the finest scale). RFSQ per-stage scaling mitigates but does not eliminate this; it is a known failure mode confirmed independently in OccWorld and Scaffold Diffusion literature. No tuning path resolves it.
+
+Beyond the structural failure: viblock3 and viblock4 experiments demonstrated that $32^3$ direct voxel prediction is achievable from a single image frame without any tokenizer. The separate tokenizer adds inference latency, introduces a frozen bottleneck that can misrepresent model predictions at deployment, and requires a staged training pipeline. None of these costs are justified at the current scale and data quantity. The tokenizer is therefore dropped from the architecture.
+
+\textbf{What replaces it:} Camera-relative direct 32$^3$ class prediction from a single RGB frame (viblock3/4), with no explicit recurrence or compression bottleneck. Grid memory recurrence is deferred to a later stage, to be revisited only if direct-prediction performance provably saturates and a compression stage becomes necessary.
+
+The remainder of this section is preserved for reference, as the design rationale and failure modes are documented information.
+\end{designdecision}
+
 \begin{warningbox}
 This section documents the tokenizer design at high specificity. Several decisions inside it (token count, FSQ parameters, synthetic noise rates, ship criteria) are derived from analogous published results rather than measurements on Minecraft data. The empirical-validation steps in Section~\ref{sec:tok-validation} are mandatory before Stage 1 commits to any specific configuration. Anyone implementing this section should review the parameter sweeps and the ship criterion thresholds with a human advisor before the first full Stage 1 training run.
 \end{warningbox}
@@ -736,7 +750,7 @@ Blockscope is a client-side Fabric 1.19.4 mod that records gameplay by running a
 
   \item \textbf{ReplayMod companion.} ReplayMod (1.19.4-2.6.20, \texttt{modCompileOnly} dependency) records all raw Minecraft 1.19.4 protocol packets to a \texttt{.mcpr} file during the session. The \texttt{.mcpr} is a zip containing a binary packet stream of \texttt{(timestamp\_ms, length, data)} tuples; it is uploaded to Hopper when the player exits the world. Block-state grids (\texttt{b}), visibility masks (\texttt{m}), and seen-before masks (\texttt{s}) are derived from the \texttt{.mcpr} in post-processing via world reconstruction from chunk packets and view-frustum ray-casting --- they are not collected in-mod.
 
-  \item \textbf{Hopper.} A FastAPI (Python) server receives streamed tick data, video segments, inputs, and the \texttt{.mcpr} over HTTP and writes them to a per-session folder. Runs on the same VPS as Lodestone for multi-client collection.
+  \item \textbf{Hopper.} A FastAPI (Python) server receives streamed tick data, video segments, inputs, and the \texttt{.mcpr} over HTTP and writes them to a per-session folder. Runs on a separate NVIDIA Brev GPU server (\texttt{https://9000-waa1tcxbl.brevlab.com}); Lodestone runs on a private VPS (\texttt{mc.vivime.info:25566}) because port forwarding is straightforward on that machine.
 \end{itemize}
 
 \textbf{Status (2026-05-19):} The full pipeline is end-to-end functional. Lodestone is deployed on a VPS at \texttt{mc.vivime.info} (port 25566), accessible directly over TCP with no client-side tunneling required. Sessions are assigned automatically on join: each client gets an isolated private world, the bot (Baritone) runs autonomously, and recordings upload to Hopper over HTTP. Active collection is underway in the limited-block-palette configuration described below. Hermitcraft-style and large random-world collection is deferred until the block-recognition heads are validated on palette data.
@@ -844,6 +858,29 @@ Field & Type & Description \\
   \item \textbf{Random generated worlds (deferred).} Systematically varies biomes, terrain types, and block distributions. Combined with the random block worlds used for the block tokenizer. Deferred for the same reason.
 \end{itemize}
 
+\subsection{Data Quantity and Known GT Issues (2026-05-28)}
+\label{sec:data-issues}
+
+\textbf{Current collection status:} 83 sessions, approximately 6 hours of gameplay, $\sim$22{,}016 labeled ticks after filtering. The viblock4 training run (run \texttt{6tpwgk7y}, 100 epochs) showed train/val loss divergence beginning around epoch 12--15, with the best val occ\_iou (0.7635) at epoch 25 and val\_loss continuing to rise thereafter. This is a data quantity signature: the model fits the training distribution while the validation distribution remains partially unseen. More data is the primary lever.
+
+\begin{openquestion}
+\textbf{Data quantity bottleneck.} viblock4 overfits within 25 epochs on $\sim$6 hours of gameplay. Estimate: 50--100 hours of labeled data is needed before the train/val loss gap stops widening within a 100-epoch run. Active collection should continue; data augmentation (random frame crops, lighting perturbation) may partially substitute.
+\end{openquestion}
+
+\textbf{GPU-based smelting (2026-05-31).} The Furnace pipeline's new labeler (\texttt{pipeline.labeler}) uses a GPU-accelerated OpenGL renderer (ModernGL, two render passes per tick) to compute the per-tick visibility mask. This replaces the old CPU-based DDA raycaster which had systematically inverted visibility. The GPU renderer is $\sim$4$\times$ faster per tick and produces correct occlusion for all block geometry including BER blocks (chests, signs, beds, shulker boxes). Smelting is parallelised across 7 GPUs (one session queue per GPU) using \texttt{CUDA\_VISIBLE\_DEVICES} for device isolation.
+
+\textbf{Shared GPU server — important operational note.} The Brev server (\texttt{drexel-gpu-name}) is shared. Before launching any GPU workload: run \texttt{nvidia-smi} and check all GPUs. A GPU showing 0\% utilisation but large memory usage (e.g., 50\,GB) is almost certainly a zombie CUDA context from a dead process --- it is NOT available and should not be used. A GPU with memory and non-zero utilisation belongs to another live user --- also do not use it. Only target GPUs with $<$100\,MiB used and 0\% utilisation. Update \texttt{CUDA\_VISIBLE\_DEVICES} accordingly before every training or smelting run.
+
+\textbf{Known GT visibility issues.} The frustum mask $m$ and the resulting visibility stratification have several known problems that will corrupt training labels until fixed in Furnace:
+
+\begin{enumerate}
+  \item \textbf{Water is missing from the vocabulary.} The current 91-class scatter palette does not include water. Water is a highly visible, commonly occluding block (oceans, rivers, rain) that the model currently treats as OOV. Any block behind water is incorrectly treated as fully visible; water blocks themselves are labeled as air. Water must be added to the vocabulary.
+
+  \item \textbf{Video frame / GT visibility desync.} The GT visibility mask is computed from \texttt{world\_states.bin} block positions and camera pose via DDA ray-casting in Furnace. However, the rendered video frame reflects Minecraft's actual rendering: transparent blocks (glass, water, leaves), semi-transparent effects (fog, particle effects), and rendering-order issues can cause visible blocks in the video that are marked invisible in GT, and vice versa. The ray-casting visibility model does not account for Minecraft's block rendering transparency table --- a glass pane in the world state is opaque to DDA rays but transparent in the video. This is a systematic source of label noise.
+
+  \item \textbf{Furnace visualize.py near-plane clipping bugs.} The local version of \texttt{furnace/pipeline/src/python/visualize.py} has uncommitted changes introducing Sutherland-Hodgman near-plane clipping and triangle-based rasterization. These changes currently produce incorrect renders (clipping artifacts, misplaced triangles). The Brev remote version does not have these changes. The local version is being fixed separately; do not sync local \texttt{visualize.py} to Brev until fixed.
+\end{enumerate}
+
 \subsection{Post-Processing Pipeline}
 \label{sec:postproc}
 
@@ -895,7 +932,9 @@ Optimal mixing ratio between mod-collected (exact GT), VPT (partial GT), and You
 
 \subsection{Stage 1: Tokenizer Pretraining}
 
-Train the multi-scale residual FSQ tokenizer (Section~\ref{sec:tokenizer}) on GT voxel grids from mod-collected data. Once the ship criteria in Section~\ref{sec:tokenizer} are met, freeze the tokenizer. It is not trained further.
+\begin{designdecision}
+\textbf{Stage 1 (tokenizer) dropped (2026-05-28).} The FSQ tokenizer failed all ship criteria (see Section~\ref{sec:tokenizer}). Direct $32^3$ voxel prediction (viblock3/4) makes a separate compression stage unnecessary at current scale. The training strategy below is revised to start directly with SigLIP + direct voxel head training. Stage 1 is removed from the active plan.
+\end{designdecision}
 
 \subsection{Stage 2: SigLIP Pretraining on Visible Blocks}
 
@@ -960,14 +999,16 @@ GR00T N1~\cite{groot} & Two-system architecture (System 2 VLM at 10 Hz + System 
 $\pi_0$~\cite{pi0} & Two-level hierarchy via mixture-of-experts; action chunking; empirical compute validation for VLM + action expert at high frequency. \\
 VOIC~\cite{voic} & Visibility-aware supervision split (vis$=2$ / vis$=1$ / vis$=0$); argument against uniform supervision contaminating clean gradients. \\
 MrSteve / Steve-1~\cite{mrsteve} & Minecraft-specific world memory via place-event tuples; contrast: we use explicit 3D voxel grid rather than embedding-based memory. \\
+VoxFormer~\cite{voxformer} & Sparse voxel transformer for camera-based 3D SSC on SemanticKITTI. Stage 1 proposes occupied voxels from depth; stage 2 MAE-style attention propagates to unobserved regions. Direct architectural precedent for the cross-attention voxel query design in viblock3. \\
+CGFormer~\cite{cgformer} & Two improvements over VoxFormer: context-dependent query initialisation (image-conditioned queries per forward pass, vs.\ VoxFormer's fixed learned embeddings) and 3D deformable attention (distinguishes depth-stacked voxels at the same 2D pixel). Informs the deformable cross-attention design in viblock3. \\
 \midrule
-\multicolumn{2}{l}{\textit{Tokenizer (Section~\ref{sec:tokenizer})}} \\
-I$^2$-World~\cite{i2world} & Multi-scale residual quantization on 3D occupancy. Closest precedent for the tokenizer architecture. \\
+\multicolumn{2}{l}{\textit{Tokenizer (Section~\ref{sec:tokenizer}) --- abandoned; kept for reference}} \\
+I$^2$-World~\cite{i2world} & Multi-scale residual quantization on 3D occupancy. Closest precedent for the (abandoned) tokenizer architecture. \\
 RQ-VAE~\cite{rqvae} & Foundational residual stacking + commitment-loss-across-stages. \\
 VAR~\cite{var} & Multi-scale spatial residual quantization with next-scale-prediction AR. \\
 FSQ~\cite{fsq} & Finite scalar quantization replacing VQ-VAE; eliminates codebook collapse. \\
-RFSQ~\cite{rfsq} & Documents and fixes residual magnitude decay in stacked FSQ. \\
-OccWorld~\cite{occworld} & Vanilla VQ-VAE on 3D occupancy; baseline approach we move beyond. \\
+RFSQ~\cite{rfsq} & Documents and fixes residual magnitude decay in stacked FSQ; directly predicts our tokenizer failure mode. \\
+OccWorld~\cite{occworld} & Vanilla VQ-VAE on 3D occupancy; documents bottleneck issues we also encountered. \\
 DFIT-OccWorld~\cite{dfitocc} & Documents OccWorld's VQ-VAE bottleneck issues directly. \\
 VQ-VAE~\cite{vqvae} & Background reference for discrete latent representation learning. \\
 \midrule
@@ -1022,6 +1063,70 @@ The cross-attention slot query design is a necessary precondition for everything
 \textbf{Logged to wandb:} attention overlays (6 slot types), inventory grid predictions, per-slot-type accuracy bar chart, confusion matrix over 973 item classes. Project: \texttt{luna-v2}. Run: \href{https://wandb.ai/venusisntprofessional-drexel-university/dropper/runs/sbclvfi9}{sbclvfi9}.
 
 \textbf{Next step.} Evaluate on real VPT frames (qualitative, bag-of-items comparison only --- VPT has no per-slot ground truth). Key open question: domain transfer from synthetic icons to real in-game rendered items under video compression.
+
+\subsection{EXP-viblock2: Per-Block Classification from SigLIP Features (2026-05-25/27)}
+
+\textbf{Question.} Can SigLIP features, augmented with 3-D block position embeddings, predict block type at each visible block position?
+
+\textbf{Architecture.} SigLIP-B/16 NaFlex $\to$ 22$\times$40 patch grid. For each visible block: look up the patch feature at the block's projected screen UV, concatenate the 3-D world-relative position $\mathbf{p} = ((x_i-16)/16, (y_i-16)/16, (z_i-16)/16)$, pass through a 441k-parameter MLP head. 91-class classification (scatter palette), 50.74\% OOV rate.
+
+\textbf{Key results.} Best top-1 = 45.80\% (epoch 6 of 30-epoch DDP run \texttt{y4j27ukw}). Training loss fell from 1.26 to 0.85 while val top-1 remained flat at 44--46\% for 24 epochs thereafter --- frozen-backbone overfitting.
+
+\textbf{Conclusion and architectural lesson.} 45.8\% is the ceiling for this formulation. The architecture is also \textit{fundamentally dishonest}: it gives the model each block's 3-D world coordinates and screen UV, which are not observable from video --- a real agent is trying to infer these from the image. On loading-screen frames (black video) the model correctly predicted plausible blocks purely from the xyz prior, confirming it was exploiting the position labels rather than learning visual geometry. The OOV rate (50.74\%) is a separate ceiling: half of all visible blocks are excluded from training. viblock2 is abandoned; the correct task is camera-relative dense $32^3$ prediction from the image alone (viblock3/4).
+
+\subsection{EXP-viblock3: Camera-Relative Dense Voxel Prediction via Cross-Attention (2026-05-27/28)}
+
+\textbf{Architecture.} Frozen SigLIP $\to$ 22$\times$40$\times$256 feature map. $32^3 = 32{,}768$ learned voxel queries (factorised position encodings) attend to the image via 2-D deformable cross-attention ($n_\text{ref}=2$, $n_\text{heads}=4$, 2 layers). Linear head outputs 92-class logits per voxel. 1.6M head parameters. GT is camera-relative: blocks are rotated by the tick's yaw before saving to \texttt{cam\_classes/}.
+
+\textbf{Key results.}
+
+\begin{center}
+\begin{tabular}{lccccc}
+\toprule
+Run (WandB) & SigLIP & Ep.\ 1 occ\_iou & Ep.\ 1 type\_acc & Peak occ\_iou & Status \\
+\midrule
+\texttt{zplbteh7} & frozen & 0.250 & 0.231 & 0.590 (ep.\ 5) & killed ep.\ 29 \\
+\texttt{2exnzevi} & unfrz12 (full) & 0.576 & 0.607 & 0.588 (ep.\ 20) & completed 100 ep. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Full SigLIP unfreeze (unfrz12) caused a val metric dip at epochs 5--10 (occ\_iou dipped to 0.492 at epoch 10) as the backbone reorganised, recovering to 0.564 by epoch 15. This adaptation pattern should be expected in any run that unfreezes SigLIP.
+
+\textbf{Conclusion.} viblock3 establishes that camera-relative dense voxel prediction is learnable from a single image frame. Limitations: the cross-attention bottleneck ($768\to256$ projection before queries touch features, no voxel-to-voxel communication) caps representational capacity. Superseded by viblock4.
+
+\subsection{EXP-viblock4: Voxel Tokens Injected into SigLIP Self-Attention (2026-05-28)}
+
+\textbf{Architecture.} $8^3=512$ learned voxel slot tokens ($\sigma=0.02$) injected into the SigLIP encoder at layer 10 of 12. Blocks 10--11 process patches and voxel tokens jointly via full self-attention. After the final block + post\_layernorm, voxel tokens are reshaped to $(8,8,8,768)$ and decoded to logits via 3-D transposed convolutions ($8^3 \to 32^3$, 2.9M head parameters). Loss: CE over all 32,768 voxels, \texttt{ignore\_index=$-1$} for OOV.
+
+\textbf{Completed run (6tpwgk7y), 100 epochs, 6 A100s, unfrz12, head\_lr=$10^{-4}$, backbone\_lr=$10^{-5}$:}
+
+\begin{center}
+\begin{tabular}{ccccl}
+\toprule
+Epoch & occ\_iou & type\_acc & val\_loss & Note \\
+\midrule
+1  & 0.720 & 0.700 & 1.172 & Strong start \\
+10 & 0.763 & 0.706 & 1.093 & \textbf{Best checkpoint} \\
+25 & \textbf{0.7635} & \textbf{0.723} & 1.155 & New best; overfitting onset \\
+50 & 0.759 & 0.695 & 1.429 & Val loss diverging \\
+75 & 0.757 & 0.689 & 1.694 & Steady overfitting \\
+100 & 0.757 & 0.684 & 1.851 & Final; best checkpoint saved at ep.\ 25 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Key findings.}
+\begin{itemize}
+  \item Best occ\_iou = \textbf{0.7635} (epoch 25); best type\_acc = \textbf{0.7226} (epoch 25). Substantially better than viblock3 (0.590) in fewer epochs, confirming the benefit of joint self-attention over cross-attention.
+  \item Train/val loss divergence begins around epoch 12--15. This is a data quantity signature: the model has effectively memorised the training distribution within 25 epochs. $\sim$22k ticks ($\approx$6 hours of gameplay) is not enough data for this architecture at this capacity. More data collection is the primary next step.
+  \item The occ\_iou metric stabilises at $\approx$0.75 in the second half of training despite rising val\_loss, suggesting the occupancy structure is well-captured but block-type classification is overfitting.
+  \item Best checkpoint (\texttt{best\_viblock4.pt}) is at epoch 25, occ\_iou=0.7635. Saved to \texttt{/data/vvm33/pum\_checkpoints/viblock4/best\_viblock4.pt} on Brev.
+\end{itemize}
+
+\begin{designdecision}
+\textbf{viblock4 is the current architecture (2026-05-28).} It supersedes viblock3 for all future experiments. The cross-attention decoder (viblock3) is a useful baseline; viblock4's joint self-attention is the primary development track.
+\end{designdecision}
 
 \subsection{EXP2: Inventory State Tracking (Planned)}
 
@@ -1144,6 +1249,10 @@ Non-hotbar items are evaluated separately: the hotbar is always on screen, so a 
   \item Persistent latent storage keying scheme (world-chunk-aligned vs.\ window-aligned).
   \item Auxiliary yaw-supervision head trained only on sun-visible frames as a learning-rate accelerator for orientation recovery.
   \item Bridge between planner and VLA: cross-attention (GR00T-style) vs.\ mixture-of-experts ($\pi_0$-style). Defer until action head is added.
+  \item \textbf{Data quantity.} viblock4 overfits within 25 epochs on $\approx$6\,h of gameplay ($\sim$22k ticks). What is the minimum data quantity before train/val loss stops diverging within 100 epochs? Estimate 50--100\,h. Collection cadence and synthetic augmentation strategy needed.
+  \item \textbf{Water and transparent blocks in vocabulary.} Water is missing from the current 91-class scatter palette. Water blocks are incorrectly labeled OOV and transparent occluders are ignored by DDA ray-casting. The Furnace visibility mask must be updated to use Minecraft's rendering transparency table before vocabulary expansion.
+  \item \textbf{GT visibility / video desync.} The frustum mask ($m$) is computed by DDA ray-casting over \texttt{world\_states.bin}, but Minecraft's renderer uses block-specific transparency (glass, water, leaves pass rays). Blocks visible in the video may be marked invisible in GT, and vice versa. Quantify the error rate and decide whether to (a) fix Furnace ray-casting with a transparency lookup table, (b) use Minecraft's actual rendered depth buffer (would require a mod change), or (c) accept label noise and train with it.
+  \item \textbf{When to add grid memory recurrence.} The tokenizer is dropped; direct $32^3$ prediction is the current target. At what performance level (occ\_iou, type\_acc) should a recurrence mechanism (e.g.\ world-aligned persistent grid, attention over previous frames' voxel outputs) be introduced? Recurrence is only worth the complexity cost if single-frame prediction has clearly saturated.
 \end{enumerate}
 
 %% ============================================================
@@ -1231,6 +1340,16 @@ Aaron van den Oord, Oriol Vinyals, and Koray Kavukcuoglu.
 Zhang et al.
 \newblock 3D representation in 512-Byte: Variational tokenizer is the key for autoregressive 3D generation.
 \newblock arXiv:2412.02202, 2024.
+
+\bibitem{voxformer}
+Yinheng Li, Han Liang, Hubert Lin, Mutian Xu, Gongjie Zhang, Yueting Yang, Rui Liu, Ling Shao, Guosheng Lin, and Chi-Man Vong.
+\newblock VoxFormer: Sparse Voxel Transformer for Camera-Based 3D Semantic Scene Completion.
+\newblock In CVPR, arXiv:2302.12251, 2023.
+
+\bibitem{cgformer}
+Jian Tang, Chen Fang, Ning Liu, Jiale Cao, Guoqing Wang, Peng Wang, and Yang Yang.
+\newblock CGFormer: Contextual Graph Transformer for 3D Semantic Scene Completion.
+\newblock In NeurIPS, arXiv:2407.16150, 2024.
 
 \end{thebibliography}
 
