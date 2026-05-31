@@ -1,70 +1,240 @@
-# Blockscope Visibility Pipeline
+# furnace/pipeline
 
-Produces per-tick training labels (visible-block mask `m`, ground-truth blocks `b`, inventory, seen_before `s`) from Minecraft 1.19.4 gameplay recordings.
+GPU-based Minecraft 1.19.4 block visibility labeler. Replaces the V1 raycaster in `furnace/pipeline/` which was fundamentally broken (inverted visibility — marked visible blocks as invisible and vice versa).
+
+TODO: add entitiy support when we need it lol
+
+## What it does
+
+For each tick of a recorded Minecraft session, the pipeline computes a uint8 `(32, 32, 32)` visibility mask: `m[i,j,k] = 1` if block cell `(i,j,k)` in the 32³ window centered on the player was geometrically visible from the camera that frame.
+
+The window covers world coordinates `[px-15, px+16) × [py-15, py+16) × [pz-15, pz+16)` where `(px, py, pz) = floor(camera position)`.
+
+Output per tick: `labels/tick_NNNNN.npz` with keys:
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `m` | uint8 (32,32,32) | Visibility mask |
+| `b` | int32 (32,32,32) | Block state IDs |
+| `inventory` | JSON string | Player hotbar/inventory |
+| `pose` | JSON string | Camera position, yaw, pitch, FOV |
+
+## Why it exists
+
+V1 (`furnace/pipeline/src/python/rasterizer.py`) used a Numba DDA raycaster that produced systematically wrong masks. Rather than debug it, it uses a proper GPU pipeline: render the 32³ window from the player's exact camera, read back which pixels have non-zero alpha, decode the block index encoded as (R,G,B) color per fragment.
 
 ## Architecture
 
-**Stage 1 (Node.js):** `src/js/parse_mcpr.js`  
-Reads the `.mcpr` zip → `recording.tmcpr` binary stream → reconstructs the Minecraft world state incrementally by replaying `map_chunk`, `block_change`, `multi_block_change`, and `respawn` packets. Snapshots the 32³ block window around the player at each tick's `replayMs`. Output: `labels/world_states.bin`.
-
-**Stage 2 (Python):** `src/python/pipeline.py`  
-Loads `world_states.bin` and `ticks.jsonl`. Casts 640×360 rays per tick using a Numba-parallel DDA raycaster (`raycaster.py`). Runs a `seen_before` post-pass (`seen_before.py`). Writes per-tick `labels/tick_NNNNN.npz` files and `labels/manifest.json`.
-
-## Visibility model
-
-Binary opaque/transparent (no Beer-Lambert). Rays cast from `player.camera.*` (the actual rendered camera transform from `GameRenderer.getCamera()`). Rays walk cells via Amanatides-Woo DDA, test each cell's AABBs (from `minecraft-data` `blockCollisionShapes.json`), terminate at the first opaque AABB hit. Transparent blocks (glass, leaves, ice, etc.) are hit and marked visible but do not terminate the ray.
-
-### Camera math
-
-Minecraft convention: `yaw=0` faces south (+Z), `yaw` increases clockwise from above, `pitch>0` looks down. The right vector is `(cos yaw, 0, sin yaw)` — **+sin, not −sin** — confirmed by Minecraft's strafing direction.
-
-```python
-fwd   = (-sin(yaw)*cos(pitch), -sin(pitch), cos(yaw)*cos(pitch))
-right = (cos(yaw), 0, sin(yaw))
-up    = cross(fwd, right)
+```
+pipeline/
+├── baker.py          # One-time: extract JAR assets → geometry cache + texture atlas
+├── renderer.py       # Per-tick: GPU render passes → visibility mask / RGB image
+├── pipeline.py       # Batch: JS stage → baker → renderer → NPZ files
+├── viewer.py         # Interactive side-by-side: video frame vs GPU render
+├── orbit.py          # Diagnostic: orbit video around one tick
+└── scripts/
+    └── gen_state_properties.js   # Node.js: state ID → {name, properties} map
 ```
 
-## F5 third-person handling
+### Baker
 
-When `cameraPerspective == "third_person_back"`, the player model is projected onto the screen and pixels inside the bounding box are skipped. This is an approximation (tight AABB, not actual geometry). Rays for occluded pixels are not cast, so cells visible only through the player model are not marked.
+Runs once per JAR version. Steps:
 
-## Block shape / opacity data
+1. Extracts `assets/minecraft/` from the JAR zip
+2. Generates `state_properties_{version}.json` via Node.js + `minecraft-data`
+3. Loads `Minecraft-Model-Reader` with the extracted assets
+4. For each of the 23,725 block state IDs: loads the block mesh, extracts triangle geometry + UV coordinates
+5. Builds a texture atlas PNG with biome tints baked in
+6. Saves `geometry_{version}.npz` — per-state vertex arrays with atlas UVs, indexed by cull direction
 
-`build_state_table.js` reads `minecraft-data` 1.19.4 `blockCollisionShapes.json` and `blocks.json` and emits `data/blockstate_table_1.19.4.json` (≈2.5 MB). Opacity = `!block.transparent`. Manual overrides in `data/opacity_overrides.json`.
+### Renderer
 
-## Performance
+Two GPU render passes per tick (ModernGL offscreen, no window required):
 
-No CUDA GPU available on this machine. Uses **Numba `@njit(parallel=True)`** over the pixel rows on 16 CPU cores. First call incurs ~20 s JIT compilation; subsequent calls are fast (≈50–200 ms/tick).
+- **Pass 1 — opaque**: depth write ON, alpha cutout. Blocks with `Transparency=FullOpaque` or `Partial`. Fragment shader writes block index as `(i/255, j/255, k/255)` to the RGBA color buffer with alpha=1.
+- **Pass 2 — translucent**: depth write OFF, `LEQUAL` depth test, blending ON. Only fluid blocks (water/lava). Same index encoding.
 
-GPU target: install `taichi` (`pip install taichi`) and rewrite `raycaster.py` to `@ti.kernel` for 10–50× speedup.
+Visibility is decoded by reading both readbacks from the color texture attachment and unioning all `(R,G,B)` values where `alpha > 0`.
 
-## V1 Limitations
+### Camera
 
-- **Particles** (snow, rain, smoke, redstone): ignored (2D billboards, not geometry).
-- **Entities** (mobs, items, projectiles): not modelled as occluders.
-- **Brightness / lighting**: ignored; implied constant 1.
-- **Continuous transparency (Beer-Lambert)**: not implemented; binary only.
+Uses the same math as `furnace/pipeline/src/python/io_helpers.py`. Camera position comes directly from `ticks.jsonl` (the mod logs the actual eye position via `GameRenderer.getCamera()`). FOV is taken from the tick data and includes potion effects.
 
-## Running
+## Prerequisites
+
+- Python ≥ 3.12 managed by `uv`
+- Node.js ≥ 18 (for `parse_mcpr.js` and `gen_state_properties.js`)
+- Minecraft 1.19.4 JAR at `visualizer/.cache/minecraft-1.19.4.jar`
+- `furnace/Minecraft-Model-Reader/` cloned (included in repo)
+
+## Setup
 
 ```bash
-# One-time: build blockstate table
-node src/js/build_state_table.js
-
-# Process a session
-python src/python/pipeline.py C:/path/to/session_XXXXXXXXX
-
-# Integration test (eyeball the renders)
-python -m pipeline.tests.test_session
+cd furnace/pipeline
+uv sync          # creates .venv, installs all Python deps
 ```
 
-## Output format
+## Dependencies
 
-`labels/tick_NNNNN.npz` keys:
-- `m` — `uint8 (32,32,32)` visibility mask
-- `b` — `int32 (32,32,32)` block-state IDs (indexed into `blockstate_table_1.19.4.json`)
-- `s` — `uint8 (32,32,32)` seen-before mask
-- `inventory` — JSON string
-- `pose` — JSON string with `x,y,z,yaw,pitch,fov,perspective`
+### Python (managed by uv / pyproject.toml)
 
-Window: world coords `[px−15, px+16) × [py−15, py+16) × [pz−15, pz+16)` where `px = floor(camera.x)` etc.
+| Package | Version | Purpose |
+|---------|---------|---------|
+| `moderngl` | ≥5.12.0 | OpenGL offscreen rendering (standalone context) |
+| `numpy` | ≥1.20 | Array ops, vertex buffers, readback decoding |
+| `pillow` | ≥12.2.0 | Texture atlas loading and saving |
+| `av` | ≥16.0.0 | PyAV — video frame extraction and orbit MP4 encoding |
+| `pygame` | ≥2.6.1 | Viewer window and display |
+| `pyglm` | ≥2.8.3 | (listed; currently unused — view matrix built with numpy) |
+| `amulet-nbt` | ≥2.0 | Required by Minecraft-Model-Reader for NBT tag types |
+| `minecraft-resource-pack` | local path | Minecraft-Model-Reader — block model loading |
+
+### Vendored (pipeline/vendor/)
+
+| Package | Origin | Purpose |
+|---------|--------|---------|
+| `minecraft_model_reader` | [Amulet MC](https://github.com/Amulet-Team/Minecraft-Model-Reader) (MIT) | Block model loading — 19 Java-path files, Bedrock stripped |
+| `amulet_nbt` | [Amulet MC](https://github.com/Amulet-Team/amulet-nbt) (MIT) | 50-line shim; only `TAG_String` needed at runtime |
+
+### Node.js (in `furnace/pipeline/node_modules/`)
+
+| Package | Purpose |
+|---------|---------|
+| `minecraft-data` | State ID → block properties mapping (baker) |
+| `prismarine-chunk` | Chunk decoding from .mcpr replay packets (JS stage) |
+| `prismarine-nbt` | NBT parsing (JS stage) |
+| `prismarine-world` | World state reconstruction (JS stage) |
+| `yauzl` | ZIP reading of .mcpr files (JS stage) |
+| `msgpack5` | MessagePack decoding (JS stage) |
+| `vec3` | 3D vector math (JS stage) |
+
+### System
+
+- **Node.js ≥ 18** — runs `parse_mcpr.js` and `gen_state_properties.js`
+- **Minecraft 1.19.4 JAR** — asset source; extracted once by baker into `cache/1.19.4/extracted_1.19.4/`
+
+## Commands
+
+### Baker
+
+```bash
+uv run python -m pipeline.baker [OPTIONS]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--jar PATH` | `visualizer/.cache/minecraft-1.19.4.jar` | Minecraft JAR to extract assets from |
+| `--version STR` | `1.19.4` | Version tag; sets cache subdirectory |
+| `--fast-graphics` | off | Bake leaves as fully opaque (matches Minecraft "Fast" graphics recordings) |
+
+Outputs to `cache/{version}/` (or `cache/{version}-fast/` with `--fast-graphics`). Safe to re-run — skips if cache already exists. Delete the `.npz` and `.png` files to force a re-bake.
+
+---
+
+### Pipeline
+
+```bash
+uv run python -m pipeline.labeler --session PATH [OPTIONS]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--session PATH` | required | Path to session directory |
+| `--version STR` | `1.19.4` | Minecraft version |
+| `--jar PATH` | auto-detected | JAR path (only needed if baker hasn't run yet) |
+| `--max-ticks N` | all | Stop after N ticks (useful for testing) |
+| `--fast-graphics` | off | Use fast-graphics cache; leaves are opaque so blocks behind them are correctly excluded from visibility |
+
+Stages run automatically if needed: JS parse → baker → per-tick render. Already-processed ticks are skipped.
+
+**For sessions recorded on "Fast" graphics, always pass `--fast-graphics`.**
+
+---
+
+### Viewer
+
+```bash
+uv run python -m pipeline.viewer --session PATH [OPTIONS]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--session PATH` | required | Path to session directory |
+| `--tick-offset N` | `1` | `frame_mapping.jsonl` tick correction |
+| `--version STR` | `1.19.4` | Cache version for rendering (always use fancy/default here) |
+
+Keys: `←` / `→` step ticks, `Q` / `Esc` quit.
+
+Left panel: video frame extracted from `video.mp4`. Right panel: GPU render of only the blocks in the tick's visibility mask.
+
+Ticks with `frame None` in the title bar have no corresponding video frame (the game processed those ticks during a loading screen or a dropped frame). These are normal and should be filtered out at training time.
+
+---
+
+### Orbit video
+
+```bash
+uv run python -m pipeline.orbit --session PATH --tick N --output orbit.mp4 [OPTIONS]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--session PATH` | required | |
+| `--tick N` | required | Tick index to orbit around |
+| `--output PATH` | `orbit.mp4` | Output MP4 |
+| `--radius FLOAT` | `15.0` | Orbit radius in blocks |
+| `--elevation FLOAT` | `5.0` | Camera height above player |
+| `--frames N` | `72` | Frame count (72 = full 360° at 24fps) |
+| `--fps N` | `24` | Output framerate |
+| `--show-invisible` | off | Render all blocks, not just visible ones |
+| `--version STR` | `1.19.4` | |
+
+---
+
+## Session directory layout
+
+```
+session_XXXXXXXXX/
+├── *.mcpr               ← replay file (any .mcpr filename)
+├── video.mp4            ← 640×360 gameplay video
+├── ticks.jsonl          ← one JSON per tick: camera pose, inventory, etc.
+├── frame_mapping.jsonl  ← tick → video frame number correspondence
+└── labels/              ← written by the pipeline
+    ├── world_states.bin ← block states per tick (written by JS stage)
+    └── tick_NNNNN.npz   ← visibility labels
+```
+
+## Cache layout
+
+```
+pipeline/cache/
+├── 1.19.4/                          ← fancy graphics (leaves translucent)
+│   ├── extracted_1.19.4/            ← JAR assets + synthesised pack.mcmeta
+│   ├── state_properties_1.19.4.json ← stateId → {name, properties}
+│   ├── geometry_1.19.4.npz          ← baked vertex data for all 23,725 states
+│   ├── atlas_1.19.4.png             ← texture atlas (tints baked in)
+│   └── meta_1.19.4.json             ← atlas dimensions, fluid UV rects
+└── 1.19.4-fast/                     ← fast graphics (leaves fully opaque)
+    ├── geometry_1.19.4-fast.npz
+    ├── atlas_1.19.4-fast.png
+    └── meta_1.19.4-fast.json
+```
+
+## Frame sync notes
+
+`frame_mapping.jsonl` maps server ticks to video frame numbers. Not every tick has a corresponding video frame — loading screens and occasional dropped frames leave gaps. These ticks have `frame None` in the viewer and should be skipped in training data loaders:
+
+```python
+valid_ticks = [t for t in range(tick_count) if frame_mapping.get(t) is not None]
+```
+
+The first ~30 ticks of a session typically have empty worlds (chunks not yet loaded in the replay). `m` will be all-zero for those ticks, which is correct.
+
+---
+
+## What V1 has that this pipeline does not
+
+| Feature | Notes |
+|---------|-------|
+| Lighting computation | `lighting.py` computes sky + block light level per cell; used for Beta 1.7 shading in the V1 CPU renderer. Not needed. |
+| `texture_map_1.19.4.json` | Per-state face→texture name mapping for the V1 CPU renderer. Not needed. |
