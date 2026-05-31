@@ -9,7 +9,7 @@
 #   EXTRA_ARGS="--my_arg value" bash train.sh                 # forward extra args to script
 #
 # Brev-specific paths (update if environment changes):
-#   BREV_ROOT  /home/vvm33/blockscope
+#   BREV_ROOT  /home/vvm33/pum
 #   Python     /home/nvidia/miniconda3/bin/python
 #   Data       /data/vvm33/
 
@@ -20,7 +20,7 @@ EXPERIMENT="${EXPERIMENT:-viblock2}"
 SCRIPT="${SCRIPT:-train_finetune.py}"
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-BREV_ROOT="${BREV_ROOT:-/home/vvm33/blockscope}"
+BREV_ROOT="${BREV_ROOT:-/home/vvm33/pum}"
 PYTHON_BIN="/home/nvidia/miniconda3/bin/python"
 TORCHRUN_BIN="/home/nvidia/miniconda3/bin/torchrun"
 
