@@ -11,11 +11,12 @@ Always runs online SigLIP (no precomputed features; voxel tokens are inside
 the encoder so the backbone must be in the forward pass).
 
 Launch:
-  EXPERIMENT=viblock4 UNFREEZE_N=2 EPOCHS=100 HEAD_LR=3e-4 BACKBONE_LR=1e-5 \\
-    INJECT_AT=10 bash /home/vvm33/blockscope/train.sh
+  EXPERIMENT=viblock4 UNFREEZE_N=12 EPOCHS=100 HEAD_LR=1e-4 BACKBONE_LR=1e-5 \\
+    CUDA_VISIBLE_DEVICES=0,1,3,4,6,7 N_GPUS=6 bash /home/vvm33/pum/train.sh
 """
 
 import argparse
+import json
 import logging
 import os
 import subprocess
@@ -23,7 +24,6 @@ import sys
 from itertools import islice
 from pathlib import Path
 
-import cv2
 import numpy as np
 import torch
 import torch.distributed as dist
