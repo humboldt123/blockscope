@@ -1,24 +1,25 @@
 data:
   n_train: 73
+  # Reuse the blocktype vocab (91 scatter classes); viblock adds sky as class 0.
   vocab_path: /data/vvm33/pum_checkpoints/blocktype/vocab.json
 
 model:
   backbone: google/siglip2-base-patch16-naflex
   feat_dim: 768
-  d_model: 256
-  n_ref: 2       # learned reference points per query per head
-  n_heads: 4
-  n_layers: 2
+  n_classes: 91   # 0..90=scatter blocks; sky+OOV ignored (ignore_index=-1)
 
 training:
-  batch_size: 8    # online SigLIP mode (unfrz2); use 64 for precomputed-only runs
+  batch_size: 8
+  lr: 0.001
   weight_decay: 0.0001
-  epochs: 50
+  epochs: 30
+  lr_warmup_epochs: 2
 
 checkpointing:
-  dir: /data/vvm33/pum_checkpoints/viblock3
+  dir: /data/vvm33/pum_checkpoints/viblock
   save_every_epochs: 5
 
 wandb:
   project: pum
   entity: venusisntprofessional-drexel-university
+  run_name: viblock_run2

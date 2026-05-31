@@ -13,12 +13,16 @@ Camera-relative coordinates:
   examples regardless of where the player is looking.
 
   Rotation (nearest-neighbor, no pitch):
-    x_cam = round( x_rel * cos(yaw) + z_rel * sin(yaw) ) + 16
-    z_cam = round(-x_rel * sin(yaw) + z_rel * cos(yaw) ) + 16
+    x_cam = round( x_rel * cos(yaw) + z_rel * sin(yaw) ) + 15
+    z_cam = round(-x_rel * sin(yaw) + z_rel * cos(yaw) ) + 15
     y_cam = yi                      (world Y unchanged — no pitch rotation)
 
-  where x_rel = xi - 16, z_rel = zi - 16 (world-relative block offsets,
-  player grid centre at (16, 16, 16)).
+  where x_rel = xi - 15, z_rel = zi - 15 (world-relative block offsets).
+  parse_mcpr.js encodes cell i → world px-15+i, so player block is at i=15.
+
+  Full raw yaw is used (cos/sin handle periodicity). The LOCAL orientation
+  shown in diagnostics is the signed residual from the nearest cardinal
+  (range [-45°, 45°]) — not the rotation angle itself.
 
   Yaw is an arbitrary real number in degrees (not bounded to [-180, 180]) —
   np.radians handles periodicity automatically via trig.
@@ -40,8 +44,10 @@ sys.path.insert(0, "/home/vvm33/blockscope/furnace/pipeline/src/python")
 
 from pum.data.vis_dataset import SMELTED_ROOT, RAW_ROOT
 
-STEM       = "viblock3_data.npz"
-FRAMES_DIR = "frames"
+STEM             = "viblock3_data.npz"
+FRAMES_DIR       = "frames"
+FEATS_DIR        = "siglip_feats"
+CAM_CLASSES_DIR  = "cam_classes"
 LOADING_SCREEN_STD = 8.0
 
 
@@ -65,21 +71,32 @@ def build_class_lut(vocab_path: Path, max_sid: int = 65535) -> np.ndarray:
     return lut
 
 
+def snap_yaw(yaw_deg: float) -> tuple[float, float]:
+    """
+    Snap raw yaw to nearest 90° cardinal and return (snap, local).
+
+    snap  : 0 / 90 / 180 / 270 — used for exact block grid rotation
+    local : residual in [-45°, +45°] — yaw offset the model must tolerate
+    """
+    s = float(round(yaw_deg / 90) * 90)
+    return s, yaw_deg - s
+
+
 def rotate_blocks_yaw(blocks: np.ndarray, yaw_deg: float) -> np.ndarray:
     """
     Rotate world-relative 32³ block grid to camera-relative coordinates.
 
     blocks   : (32, 32, 32) uint16  block-state IDs (0 = air)
-    yaw_deg  : float                player yaw in Minecraft degrees
+    yaw_deg  : float                yaw in degrees — MUST be a multiple of 90
+                                    (use snap_yaw() to get the snapped value)
     returns  : (32, 32, 32) uint16  camera-relative block-state IDs
 
     Minecraft coordinate system: X=east, Y=up, Z=south.
     Camera right = [cos(yaw), 0, sin(yaw)] in world (X, Y, Z).
     Camera forward (horizontal) = [-sin(yaw), 0, cos(yaw)].
 
-    Non-90° yaws cause nearest-neighbor aliasing (some grid cells get two
-    world blocks; the higher-index one wins).  This is acceptable noise for
-    a training signal.
+    At exact 90° multiples this is a lossless permutation — no aliasing,
+    no corner clipping.  Caller is responsible for snapping before calling.
     """
     yaw_rad = np.radians(yaw_deg)
     cos_y   = float(np.cos(yaw_rad))
@@ -90,11 +107,11 @@ def rotate_blocks_yaw(blocks: np.ndarray, yaw_deg: float) -> np.ndarray:
         return np.zeros((32, 32, 32), dtype=np.uint16)
 
     sids  = blocks[xi, yi, zi]
-    x_rel = xi.astype(np.float32) - 16.0
-    z_rel = zi.astype(np.float32) - 16.0
+    x_rel = xi.astype(np.float32) - 15.0
+    z_rel = zi.astype(np.float32) - 15.0
 
-    xi_cam = (np.round(x_rel * cos_y + z_rel * sin_y).astype(np.int32) + 16)
-    zi_cam = (np.round(-x_rel * sin_y + z_rel * cos_y).astype(np.int32) + 16)
+    xi_cam = (np.round(x_rel * cos_y + z_rel * sin_y).astype(np.int32) + 15)
+    zi_cam = (np.round(-x_rel * sin_y + z_rel * cos_y).astype(np.int32) + 15)
     # yi is unchanged (no pitch rotation)
 
     valid = (
@@ -112,19 +129,23 @@ class ViBlock3Dataset(IterableDataset):
     """
     Iterable dataset for viblock3.
 
-    Yields (frame_rgb, cam_blocks):
-      frame_rgb  : (H, W, 3)    uint8   raw RGB
-      cam_blocks : (32, 32, 32) int64   class indices (0=air, 1..N=block, -1=OOV)
+    If precomputed SigLIP features exist (siglip_feats/<tick>.npy), yields:
+      patch_grid : (22, 40, 768) float16  precomputed SigLIP features
+      cam_blocks : (32, 32, 32)  int64    class indices (0=air, 1..N=block, -1=OOV)
+
+    Otherwise falls back to raw frames (for online SigLIP mode):
+      frame_rgb  : (H, W, 3)    uint8    raw RGB
+      cam_blocks : (32, 32, 32) int64
     """
 
-    def __init__(self, session_names: list[str], vocab_path: Path, shuffle: bool = True):
+    def __init__(self, session_names: list[str], vocab_path: Path, shuffle: bool = True,
+                 precomputed: bool = True):
         self.session_names = list(session_names)
         self.shuffle       = shuffle
         self.class_lut     = build_class_lut(vocab_path)
+        self.precomputed   = precomputed  # if False, skip precomputed feats even if they exist
 
     def __iter__(self):
-        from io_helpers import load_world_states  # type: ignore
-
         sessions = list(self.session_names)
         if self.shuffle:
             np.random.shuffle(sessions)
@@ -137,23 +158,34 @@ class ViBlock3Dataset(IterableDataset):
         lut = self.class_lut
 
         for session in sessions:
-            labels_dir = SMELTED_ROOT / session / "labels"
-            data_path  = labels_dir / STEM
-            frames_dir = labels_dir / FRAMES_DIR
-            video_path = RAW_ROOT / session / "video.mp4"
+            labels_dir    = SMELTED_ROOT / session / "labels"
+            data_path     = labels_dir / STEM
+            feats_dir     = labels_dir / FEATS_DIR
+            cam_cls_dir   = labels_dir / CAM_CLASSES_DIR
+            frames_dir    = labels_dir / FRAMES_DIR
+            video_path    = RAW_ROOT / session / "video.mp4"
 
-            if not data_path.exists() or not (labels_dir / "world_states.bin").exists():
+            if not data_path.exists():
                 continue
-
-            _, _, _, blocks = load_world_states(labels_dir)
 
             d            = np.load(data_path)
             tick_indices = d["tick_indices"]
             tick_yaws    = d["tick_yaws"]
 
+            use_cam_cls     = cam_cls_dir.exists()
+            use_precomputed = self.precomputed and feats_dir.exists()
+
+            # Only need world_states if cam_classes not precomputed
+            blocks = None
+            if not use_cam_cls:
+                if not (labels_dir / "world_states.bin").exists():
+                    continue
+                from io_helpers import load_world_states  # type: ignore
+                _, _, _, blocks = load_world_states(labels_dir)
+
             use_jpegs = frames_dir.exists()
             cap = None
-            if not use_jpegs and video_path.exists():
+            if not use_precomputed and not use_jpegs and video_path.exists():
                 cap = cv2.VideoCapture(str(video_path))
 
             order = np.arange(len(tick_indices))
@@ -164,38 +196,60 @@ class ViBlock3Dataset(IterableDataset):
                 tick_idx = int(tick_indices[k])
                 yaw      = float(tick_yaws[k])
 
-                if tick_idx >= len(blocks):
-                    continue
+                # Get camera-relative class labels
+                if use_cam_cls:
+                    cls_path = cam_cls_dir / f"{tick_idx:06d}.npy"
+                    if not cls_path.exists():
+                        continue
+                    cam_classes = np.load(str(cls_path)).astype(np.int64)  # (32,32,32)
+                else:
+                    if tick_idx >= len(blocks):
+                        continue
+                    snap, _ = snap_yaw(yaw)
+                    cam_blocks_u16 = rotate_blocks_yaw(blocks[tick_idx], snap)
+                    flat           = cam_blocks_u16.reshape(-1)
+                    cam_classes    = lut[np.clip(flat, 0, len(lut) - 1)].reshape(32, 32, 32)
 
-                frame_rgb = None
-                if use_jpegs:
-                    jpg = frames_dir / f"{tick_idx:06d}.jpg"
-                    if jpg.exists():
-                        bgr = cv2.imread(str(jpg))
-                        if bgr is not None:
+                if use_precomputed:
+                    feat_path = feats_dir / f"{tick_idx:06d}.npy"
+                    if not feat_path.exists():
+                        continue
+                    patch_grid = np.load(str(feat_path))   # (22, 40, 768) float16
+                    yield patch_grid, cam_classes
+                else:
+                    frame_rgb = None
+                    if use_jpegs:
+                        jpg = frames_dir / f"{tick_idx:06d}.jpg"
+                        if jpg.exists():
+                            bgr = cv2.imread(str(jpg))
+                            if bgr is not None:
+                                frame_rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                    if frame_rgb is None and cap is not None:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, tick_idx)
+                        ok, bgr = cap.read()
+                        if ok:
                             frame_rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-
-                if frame_rgb is None and cap is not None:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, tick_idx)
-                    ok, bgr = cap.read()
-                    if ok:
-                        frame_rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-
-                if frame_rgb is None or frame_rgb.std() < LOADING_SCREEN_STD:
-                    continue
-
-                cam_blocks_u16 = rotate_blocks_yaw(blocks[tick_idx], yaw)
-                flat           = cam_blocks_u16.reshape(-1)
-                cam_classes    = lut[np.clip(flat, 0, len(lut) - 1)].reshape(32, 32, 32)
-
-                yield frame_rgb, cam_classes
+                    if frame_rgb is None or frame_rgb.std() < LOADING_SCREEN_STD:
+                        continue
+                    yield frame_rgb, cam_classes
 
             if cap is not None:
                 cap.release()
 
 
 def collate_fn(batch):
-    """Stack fixed-size targets; keep frames as a list for SigLIP preprocessing."""
-    frames     = [b[0] for b in batch]
-    cam_blocks = torch.stack([torch.from_numpy(b[1]) for b in batch])  # (B, 32, 32, 32)
-    return frames, cam_blocks
+    """
+    Stack fixed-size targets. First element is either:
+      - (22,40,768) float16 ndarray  → precomputed SigLIP features (stack into tensor)
+      - (H,W,3)    uint8  ndarray    → raw frame (keep as list for SigLIP processor)
+    """
+    first = batch[0][0]
+    cam_blocks = torch.stack([torch.from_numpy(b[1]) for b in batch])   # (B,32,32,32)
+    if first.dtype == np.float16:
+        # Precomputed mode: stack into (B, 22, 40, 768) float16 tensor
+        patch_grids = torch.stack([torch.from_numpy(b[0]) for b in batch])
+        return patch_grids, cam_blocks
+    else:
+        # Online SigLIP mode: keep frames as list
+        frames = [b[0] for b in batch]
+        return frames, cam_blocks

@@ -1,0 +1,28 @@
+data:
+  n_train: 73
+
+model:
+  feat_dim: 768          # DINOv2 ViT-B/14 patch feature dimension
+  block_embed_dim: 64    # block-state embedding dim (concatenated with DINOv2 feat)
+  hidden_dim: 512        # 0 = linear probe; >0 = one hidden layer MLP
+  dropout: 0.1
+
+training:
+  frame_batch_size: 16   # frames per DINOv2 forward pass (GPU)
+  lr: 0.001
+  weight_decay: 0.0001
+  epochs: 30
+  lr_warmup_epochs: 2
+  pos_weight: 1.0        # 1.0 = no weighting; threshold sweep finds optimal cutoff
+
+checkpointing:
+  dir: /data/vvm33/pum_checkpoints/vis_binary
+  save_every_epochs: 5
+
+vis:
+  render_every_epochs: 5
+
+wandb:
+  project: pum
+  entity: venusisntprofessional-drexel-university
+  run_name: vis_binary_run4_embed

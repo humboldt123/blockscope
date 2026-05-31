@@ -1,0 +1,35 @@
+data:
+  raw_data_dir: /data/vvm33/BLOCKSCOPE_DATA
+  smelted_dir: /data/vvm33/SMELTED_DATA
+  furnace_root: /home/vvm33/blockscope/furnace/pipeline
+  n_train: 73
+  n_workers: 4     # per-GPU process; 8 total across 2 GPUs
+
+model:
+  d_embed: 32
+  channels: 256
+  fsq_d: 6
+  fsq_L: 5
+
+training:
+  batch_size: 8    # per GPU; effective batch = 16 across 2 GPUs
+  lr: 0.0003
+  weight_decay: 0.0001          # raised from 1e-5 → 1e-4 (Run 2 regularisation)
+  epochs: 100
+  lr_warmup_epochs: 5
+  air_loss_weight: 0.05         # alpha for air/unknown token in focal loss
+  focal_gamma: 2.0              # focal loss modulating exponent
+  early_stopping_patience: 5   # stop if val_nonair_acc does not improve for N epochs
+
+checkpointing:
+  dir: /data/vvm33/pum_checkpoints/stage1
+  save_every_epochs: 10
+
+vis:
+  probe_render_every_epochs: 5
+  n_probe_ticks: 8
+
+wandb:
+  project: pum
+  entity: venusisntprofessional-drexel-university
+  run_name: stage1_run2_focal_synth

@@ -1,0 +1,27 @@
+data:
+  n_train: 73
+  vocab_path: /data/vvm33/pum_checkpoints/blocktype/vocab.json
+
+model:
+  feat_dim: 768
+  hidden_dim: 512
+  dropout: 0.1
+
+training:
+  frame_batch_size: 16
+  lr: 0.001
+  weight_decay: 0.0001
+  epochs: 30
+  lr_warmup_epochs: 2
+
+checkpointing:
+  dir: /data/vvm33/pum_checkpoints/blocktype
+  save_every_epochs: 5
+
+vis:
+  render_every_epochs: 5
+
+wandb:
+  project: pum
+  entity: venusisntprofessional-drexel-university
+  run_name: blocktype_run1

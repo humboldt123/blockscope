@@ -1,0 +1,97 @@
+pum/
+├── ALL.txt                                   this file
+├── __init__.py
+│
+├── vocab/
+│   ├── __init__.py
+│   ├── build_vocab.py                        maps blockstate SIDs → class indices from KNOWN set
+│   ├── find_palette.py                       finds which blocks appear in a dataset
+│   └── TOKEN_LIST.txt                        full block list
+│
+├── data/
+│   ├── __init__.py
+│   ├── vis_dataset.py                        SMELTED_ROOT / RAW_ROOT paths + FeatureDataset
+│   ├── tok_dataset.py                        PyTorch Dataset; reads world_states.bin per session
+│   ├── patch_label_dataset.py                per-patch label dataset for viblock experiments
+│   └── synth_dataset.py                      synthetic inventory screenshot dataset (EXP1)
+│
+├── models/
+│   ├── __init__.py
+│   └── tokenizer.py.old                      ABANDONED: multi-scale residual FSQ tokenizer
+│                                              Structural failure (mIoU=9.9% at epoch 10).
+│                                              See living.tex §3 for post-mortem.
+│
+├── utils/
+│   ├── __init__.py
+│   └── smelt.py                              smelt helpers
+│
+└── experiments/
+    ├── __init__.py
+    │
+    ├── blocktype/                            vocab + blocktype classifier
+    │   ├── __init__.py
+    │   ├── build_vocab.py                    generates vocab.json (sid_to_class mapping)
+    │   ├── train.py
+    │   └── eval.py
+    │
+    ├── stage1/                               ABANDONED: FSQ tokenizer training
+    │   ├── __init__.py
+    │   ├── train.py
+    │   └── eval.py
+    │
+    ├── viblock/                              ABANDONED: per-patch block prediction (sky collapse)
+    │   ├── __init__.py
+    │   ├── precompute_patch_labels.py
+    │   └── train.py
+    │
+    ├── viblock2/                             ABANDONED: per-visible-block SigLIP+xyz (cheated)
+    │   ├── __init__.py                       Best: 45.8% top-1 — gave xyz to model (wrong)
+    │   ├── precompute_data.py
+    │   ├── precompute_frames.py              video frame → JPEG; uses PyAV (not cv2)
+    │   ├── precompute_siglip_feats.py
+    │   ├── eval_viz.py
+    │   ├── train.py
+    │   └── train_finetune.py
+    │
+    ├── viblock3/                             SUPERSEDED: cross-attention dense 32³ prediction
+    │   ├── __init__.py                       Best: occ_iou=0.590 (unfrz12, run 2exnzevi)
+    │   ├── dataset.py                        ViBlock3Dataset; snap_yaw; rotate_blocks_yaw
+    │   ├── model.py                          2-layer deformable cross-attention decoder
+    │   ├── precompute_cam_classes.py         cam-relative class arrays — uses snap_yaw (critical)
+    │   ├── precompute_data.py
+    │   ├── precompute_siglip_feats.py
+    │   └── train_finetune.py
+    │
+    ├── viblock4/                             CURRENT: SigLIP + injected 8³ voxel slot tokens
+    │   ├── __init__.py                       Best run 6tpwgk7y: occ_iou=0.7635 @ epoch 25
+    │   ├── model.py                          tokens injected at layer 10; 3D conv upsample
+    │   ├── train_finetune.py                 DDP 6-GPU; WandB renders every 5 epochs
+    │   ├── render_html.py                    standalone HTML render tool
+    │   ├── diag_gt_sync.py                   diagnostic: precomputed vs on-the-fly cam_classes
+    │   └── diag_render.py                    diagnostic: verify GT renders non-empty
+    │
+    └── vis/                                  binary visibility prediction (dead-end baseline)
+        ├── __init__.py
+        ├── extract_features.py
+        ├── precompute_visibility.py
+        └── train.py
+
+─────────────────────────────────────────────────────────────────────────────
+Notes
+─────────────────────────────────────────────────────────────────────────────
+Vocab (Brev): /data/vvm33/pum_checkpoints/blocktype/vocab.json
+  n_classes=93 (91 scatter palette + water class 91 + grass class 92)
+  sid_to_class maps raw uint16 SIDs → 0-based class indices
+
+cam_classes: SMELTED_DATA/<session>/labels/cam_classes/{tick:06d}.npy
+  int8 (32,32,32) — 0=air, 1..92=block, -1=OOV (ignore_index in CE)
+  Rotation: snap raw yaw to nearest 90° then rotate block grid
+
+Tick NPZ (new Furnace, BLOCKSCOPE_DATA/<session>/labels/tick_NNNNN.npz):
+  b: (32,32,32) int32 — localized block SIDs (cam-space, snap_yaw applied)
+  m: (32,32,32) uint8 — localized visibility mask (same rotation as b)
+  local_yaw: float32 — residual after snapping, for renderer
+  inventory, pose: JSON strings
+
+Training: always bash /home/vvm33/blockscope/train.sh with env-var overrides
+WandB: venusisntprofessional-drexel-university/pum

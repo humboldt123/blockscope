@@ -99,6 +99,7 @@ def precompute_session(session: str, force: bool = False) -> bool:
 
     valid_tick_indices = []
     valid_yaws         = []
+    valid_pitches      = []
 
     for k in range(len(tick_indices)):
         tick_idx = int(tick_indices[k])
@@ -106,9 +107,12 @@ def precompute_session(session: str, force: bool = False) -> bool:
             continue
         tick   = ticks[tick_idx]
         player = tick.get("player", tick)
-        yaw    = float(player.get("yaw", 0.0))
+        camera = player.get("camera", player)   # camera pos/angles, falls back to player in F5
+        yaw    = float(camera.get("yaw",   player.get("yaw",   0.0)))
+        pitch  = float(camera.get("pitch", player.get("pitch", 0.0)))
         valid_tick_indices.append(tick_idx)
         valid_yaws.append(yaw)
+        valid_pitches.append(pitch)
 
     if not valid_tick_indices:
         log.warning("skip %s (no valid ticks)", session)
@@ -116,8 +120,9 @@ def precompute_session(session: str, force: bool = False) -> bool:
 
     np.savez_compressed(
         out_path,
-        tick_indices = np.array(valid_tick_indices, dtype=np.int32),
-        tick_yaws    = np.array(valid_yaws,         dtype=np.float32),
+        tick_indices  = np.array(valid_tick_indices, dtype=np.int32),
+        tick_yaws     = np.array(valid_yaws,         dtype=np.float32),
+        tick_pitches  = np.array(valid_pitches,      dtype=np.float32),
     )
     log.info("%s: saved %d ticks", session, len(valid_tick_indices))
     return True
