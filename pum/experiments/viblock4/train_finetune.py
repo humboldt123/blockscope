@@ -171,9 +171,10 @@ def _build_class_to_sid(vocab_path: Path) -> dict:
         from pathlib import Path as _Path
         sp_path = vocab_path.parent.parent / "pum_checkpoints" / "blocktype" / "state_properties_1.19.4.json"
         # Try standard Brev path, then relative to vocab
+        _repo = _Path(__file__).resolve().parents[3]   # .../pum/
         for candidate in [
+            _repo / "furnace/pipeline/cache/1.19.4/state_properties_1.19.4.json",
             _Path("/data/vvm33/pum_checkpoints/blocktype/state_properties_1.19.4.json"),
-            _Path(__file__).resolve().parents[5] / "furnace/pipeline/cache/1.19.4/state_properties_1.19.4.json",
         ]:
             if candidate.exists():
                 state_props = json.loads(candidate.read_text())
