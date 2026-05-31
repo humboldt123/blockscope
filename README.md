@@ -1,6 +1,12 @@
-# blockscope
+# PlayerYouMean
 
-Data collection infrastructure for training Minecraft AI agents. See `paper/` for the research design.
+Research, experiments, training, data collection infrastructure, etc. for training Minecraft AI agents. See `paper/` for the research design.
+
+<p><em>I see the player you mean.</em></p>
+<p align="right">PLAYERNAME?</p>
+<p><em>Yes. Take care. It has reached a higher level now. It can read our thoughts.</em></p>
+<p align="right">— <em>Minecraft End Poem</em></p>
+
 
 ## Components
 
