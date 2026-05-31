@@ -34,7 +34,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-sys.path.insert(0, "/home/vvm33/blockscope/furnace/pipeline/src/python")
+# New furnace pipeline (renderer) lives under furnace/pipeline/
+_FURNACE_DIR = Path(__file__).resolve().parents[3] / "furnace"
+if str(_FURNACE_DIR) not in sys.path:
+    sys.path.insert(0, str(_FURNACE_DIR))
 
 from pum.data.vis_dataset import SMELTED_ROOT
 from pum.experiments.viblock3.dataset import ViBlock3Dataset, collate_fn, STEM
@@ -162,11 +165,30 @@ def _build_class_to_sid(vocab_path: Path) -> dict:
     return out
 
 
+_gpu_renderer = None   # lazy-initialized singleton
+
+def _get_renderer():
+    global _gpu_renderer
+    if _gpu_renderer is None:
+        for cache_candidate in [
+            Path("/home/vvm33/blockscope/furnace/pipeline/cache"),
+            Path(__file__).resolve().parents[3] / "furnace" / "pipeline" / "cache",
+        ]:
+            if cache_candidate.exists():
+                from pipeline.renderer import Renderer
+                _gpu_renderer = Renderer(cache_candidate, "1.19.4")
+                log.info("GPU renderer initialised from %s", cache_candidate)
+                break
+        if _gpu_renderer is None:
+            log.warning("GPU renderer: no baker cache found — renders will be skipped")
+    return _gpu_renderer
+
+
 def render_wandb_samples(model, proc, train_sessions: list, val_sessions: list,
                          cls_to_sid: dict, n_each: int, device: torch.device, epoch: int):
-    """Render video|GT|pred strips for n_each train+val ticks, log to WandB as wandb.Image."""
+    """Render [video | GT reconstruction | model prediction] strips and log to WandB."""
     import wandb
-    from visualize import render_perspective_view, IMG_W, IMG_H  # type: ignore
+    IMG_W, IMG_H = 640, 360
 
     max_cls = max(cls_to_sid.keys(), default=0)
     sid_lut = np.zeros(max_cls + 1, dtype=np.int32)
@@ -241,8 +263,13 @@ def render_wandb_samples(model, proc, train_sessions: list, val_sessions: list,
                 pred_sid = sid_lut[np.clip(pred_cls, 0, max_cls)]
                 pred_sid[pred_cls <= 0] = 0
 
-                r_gt   = render_perspective_view((gt_sid > 0),   gt_sid,   pose, fullbright=True)
-                r_pred = render_perspective_view((pred_sid > 0), pred_sid, pose, fullbright=True)
+                renderer = _get_renderer()
+                if renderer is None:
+                    continue
+                pose_r = {"x": 15.5, "y": 15.62, "z": 15.5,
+                          "yaw": local_y, "pitch": pitch, "fov": 70.0}
+                r_gt   = renderer.render_rgb(gt_sid.astype(np.uint16),   pose_r, (15, 15, 15), mask=None)
+                r_pred = renderer.render_rgb(pred_sid.astype(np.uint16), pose_r, (15, 15, 15), mask=None)
                 f_vid  = np.array(Image.fromarray(frame_rgb).resize((IMG_W, IMG_H)))
                 strip  = np.concatenate([f_vid, r_gt, r_pred], axis=1)
 
@@ -335,9 +362,10 @@ def main():
         log.info("DDP world_size=%d | train sessions=%d | val sessions=%d",
                  world_size, len(all_train), len(val_sessions))
 
-    bs        = cfg["training"]["batch_size"]
-    m_cfg     = cfg["model"]
-    n_classes = m_cfg.get("n_classes", 91)
+    bs    = cfg["training"]["batch_size"]
+    m_cfg = cfg["model"]
+    with open(vocab_path) as _vf:
+        n_classes = json.load(_vf)["n_classes"]   # read from vocab (currently 93)
 
     # Dataset always online (no precomputed mode — voxel tokens live inside SigLIP)
     train_ds     = ViBlock3Dataset(train_sessions, vocab_path, shuffle=True, precomputed=False)
