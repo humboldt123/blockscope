@@ -24,6 +24,7 @@ gradle-7.5.1/
 TODO.md
 ROADMAP.md
 TECHNICAL.md
+FOR_CLAUDE.md
 
 # AI-generated scratch docs
 CHUNK_RENDERING_ANALYSIS.md
@@ -31,8 +32,15 @@ IMPLEMENTATION_SUMMARY.md
 QUICK_REFERENCE.md
 SOLUTION_SUMMARY.md
 
+# Python packaging artifacts
+*.egg-info/
+
 # Junk
 dummy/
 hi
 server.pid
 TODO MAY 18
+papers_for*
+SERVERS*
+docs/
+!docs/*tex
