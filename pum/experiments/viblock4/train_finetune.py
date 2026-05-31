@@ -153,15 +153,54 @@ def evaluate(model, proc, val_loader, n_classes, device):
 # ── WandB renders (rank 0 only) ───────────────────────────────────────────────
 
 def _build_class_to_sid(vocab_path: Path) -> dict:
-    import json
+    """Map class index → a canonical block state ID for rendering.
+    Prefers states with snowy=false, axis=y, facing=south, waterlogged=false, half=lower.
+    Without these preferences the smallest SID is used, which often picks unusual
+    variants (e.g. snowy grass, horizontal logs) that look wrong in renders.
+    """
+    # Canonical preference: lower score = more preferred
+    _PREF = {"snowy": {"false": 0, "true": 10},
+             "axis":  {"y": 0, "x": 5, "z": 5},
+             "facing": {"south": 0, "north": 1, "east": 1, "west": 1, "up": 2, "down": 2},
+             "half":  {"lower": 0, "bottom": 0, "upper": 5, "top": 5},
+             "waterlogged": {"false": 0, "true": 3},
+             "type": {"single": 0, "double": 3, "left": 2, "right": 2}}
+
+    try:
+        import json
+        from pathlib import Path as _Path
+        sp_path = vocab_path.parent.parent / "pum_checkpoints" / "blocktype" / "state_properties_1.19.4.json"
+        # Try standard Brev path, then relative to vocab
+        for candidate in [
+            _Path("/data/vvm33/pum_checkpoints/blocktype/state_properties_1.19.4.json"),
+            _Path(__file__).resolve().parents[5] / "furnace/pipeline/cache/1.19.4/state_properties_1.19.4.json",
+        ]:
+            if candidate.exists():
+                state_props = json.loads(candidate.read_text())
+                break
+        else:
+            state_props = {}
+    except Exception:
+        state_props = {}
+
     with open(vocab_path) as f:
         v = json.load(f)
+
+    def _score(sid: int) -> int:
+        sp = state_props.get(str(sid), {})
+        props = sp.get("properties", {})
+        return sum(_PREF.get(k, {}).get(v2, 0) for k, v2 in props.items())
+
     out = {0: 0}
+    # Group SIDs by class, then pick the one with the lowest "weirdness" score
+    from collections import defaultdict
+    by_class: dict = defaultdict(list)
     for sid_str, cls in v["sid_to_class"].items():
-        sid = int(sid_str)
-        vb_cls = int(cls) + 1
-        if vb_cls not in out or sid < out[vb_cls]:
-            out[vb_cls] = sid
+        by_class[int(cls) + 1].append(int(sid_str))
+
+    for vb_cls, sids in by_class.items():
+        out[vb_cls] = min(sids, key=_score)
+
     return out
 
 
