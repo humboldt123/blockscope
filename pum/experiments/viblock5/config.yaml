@@ -1,0 +1,29 @@
+data:
+  n_train: 73
+  vocab_path: /data/vvm33/pum_checkpoints/blocktype/vocab.json
+
+model:
+  backbone: google/siglip2-base-patch16-naflex
+  feat_dim: 768
+  inject_at: 10   # inject voxel tokens after this many SigLIP encoder blocks (of 12 total)
+  vox_res: 8      # coarse voxel resolution; n_vox = vox_res^3 = 512 tokens injected
+  mid_dim: 256    # conv upsample intermediate channels
+
+training:
+  batch_size: 8         # per GPU; always online SigLIP (voxel tokens live inside encoder)
+  weight_decay: 0.0001
+  epochs: 100
+  unfreeze_n: 2         # unfreeze last N SigLIP blocks + post_layernorm; 12 = full unfreeze
+  # E10: per-voxel loss weight for occluded / behind-camera voxels.
+  #   0.0  → pure single-frame perception (supervise only what the camera sees).
+  #   >0   → partial credit for occluded space (only sensible once grid memory
+  #          makes occluded voxels legitimately inferable; keep 0.0 for now).
+  occluded_weight: 0.0
+
+checkpointing:
+  dir: /data/vvm33/pum_checkpoints/viblock5
+  save_every_epochs: 5
+
+wandb:
+  project: pum
+  entity: venusisntprofessional-drexel-university
