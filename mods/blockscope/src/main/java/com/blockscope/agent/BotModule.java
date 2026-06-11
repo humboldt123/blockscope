@@ -6,6 +6,7 @@ import baritone.api.pathing.goals.GoalBlock;
 import baritone.api.pathing.goals.GoalXZ;
 import baritone.api.pathing.goals.GoalYLevel;
 import baritone.api.process.IBaritoneProcess;
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.minecraft.block.Block;
 import net.minecraft.block.Blocks;
 import net.minecraft.client.MinecraftClient;
@@ -13,29 +14,40 @@ import net.minecraft.item.Items;
 import net.minecraft.text.Text;
 import net.minecraft.util.ActionResult;
 import net.minecraft.util.Hand;
+import net.minecraft.util.Identifier;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.LightType;
 
+import java.util.Queue;
 import java.util.Random;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Autonomous data-collection bot.  Two modes:
+ * Autonomous data-collection bot.  Three modes:
  *
  *   CREATIVE_SURVEY  — enables creative flight and uses Baritone's explore
  *                      process to sweep the map at ground level.
  *
  *   SURVIVAL_GATHER  — cycles: chop wood → surface ores → explore → deep ores.
+ *                      Interior exploration is driven by a two-tier system:
+ *                        1. structureHints queue — positions pushed by Lodestone's
+ *                           StructureGuide over the "blockscope:structures" channel.
+ *                        2. INTERIOR_BLOCKS scan — detects structure signatures in the
+ *                           loaded world even when Lodestone is absent.
  *
- *   VOID_SCATTER     — void world seeded with random known blocks; every 30 s
- *                      Baritone pathfinds to a random scatter block, scaffolding
- *                      with the stacks of blocks in inventory.
+ *   VOID_SCATTER     — void world with a connected branching walkway (VoidScatterGenerator).
+ *                      Baritone's explore process follows the path naturally; no random
+ *                      Y-goals are needed since staircases are baked into the world.
  *
  * Toggle with G.  Cycle modes (while stopped) with H.
  * Requires baritone-api-fabric-1.9.5.jar in mods folder.
+ *
+ * Call BotModule.init() once from the client mod initialiser to register
+ * the optional "blockscope:structures" plugin channel listener.
  */
 public class BotModule {
 
@@ -47,16 +59,21 @@ public class BotModule {
     private Mode mode = Mode.CREATIVE_SURVEY;
     private final Random rng = new Random();
 
-    // Smooth look state for creative survey (freeLook=true, we drive yaw/pitch ourselves)
-    private double lookYaw      = 0;   // current interpolated yaw  (applied to player)
-    private double lookPitch    = 0;   // current interpolated pitch
-    private double targetYaw    = 0;   // goal we're lerping toward
+    // Smooth look state for creative survey
+    private double lookYaw      = 0;
+    private double lookPitch    = 0;
+    private double targetYaw    = 0;
     private double targetPitch  = 0;
-    private int    lookHoldTicks = 0;  // ticks until next target re-roll
+    private int    lookHoldTicks = 0;
     private boolean lookInitialized = false;
-    private boolean useFreeLook = false; // true only in creative survey
+    private boolean useFreeLook = false;
 
     private int torchCheckTicks = 0;
+
+    // Structure positions received from Lodestone's StructureGuide channel.
+    // Empty when not connected to a Lodestone server — bot falls back to
+    // local interior-block detection.
+    private final Queue<BlockPos> structureHints = new ConcurrentLinkedQueue<>();
 
     private BotModule() {}
 
@@ -65,13 +82,38 @@ public class BotModule {
         return instance;
     }
 
+    /**
+     * Register the optional Lodestone structure-hint channel.  Call once from
+     * BlockscopeClient.onInitializeClient() inside the baritonePresent block.
+     * Safe to call even on servers without Lodestone — the channel simply receives no packets.
+     */
+    public static void init() {
+        ClientPlayNetworking.registerGlobalReceiver(
+            new Identifier("blockscope", "structures"),
+            (client, handler, buf, responseSender) -> {
+                int count = buf.readInt();
+                BlockPos[] positions = new BlockPos[count];
+                for (int i = 0; i < count; i++)
+                    positions[i] = new BlockPos(buf.readInt(), 64, buf.readInt());
+                client.execute(() -> {
+                    BotModule bot = BotModule.getInstance();
+                    for (BlockPos pos : positions) bot.structureHints.add(pos);
+                });
+            }
+        );
+    }
+
     public boolean isRunning() { return running.get(); }
     public Mode    getMode()   { return mode; }
     public void    setMode(Mode m) { if (!running.get()) mode = m; }
 
     public void cycleMode() {
         if (running.get()) { log("§c[Bot] Stop the bot before changing mode."); return; }
-        mode = (mode == Mode.CREATIVE_SURVEY) ? Mode.SURVIVAL_GATHER : Mode.CREATIVE_SURVEY;
+        mode = switch (mode) {
+            case CREATIVE_SURVEY -> Mode.SURVIVAL_GATHER;
+            case SURVIVAL_GATHER -> Mode.VOID_SCATTER;
+            case VOID_SCATTER    -> Mode.CREATIVE_SURVEY;
+        };
         log("§e[Bot] Mode → " + mode);
     }
 
@@ -118,7 +160,6 @@ public class BotModule {
         tickTorchCheck(mc);
         if (!useFreeLook) return;
 
-        // Seed initial position from actual player look so there's no jump on start
         if (!lookInitialized) {
             lookYaw   = mc.player.getYaw();
             lookPitch = mc.player.getPitch();
@@ -127,30 +168,21 @@ public class BotModule {
             lookInitialized = true;
         }
 
-        // Pick a new target periodically
         if (lookHoldTicks <= 0) {
             Vec3d vel = mc.player.getVelocity();
             double hSpeed = Math.sqrt(vel.x * vel.x + vel.z * vel.z);
-
-            // Base yaw on movement direction when moving, else stay near current look
             double baseYaw = hSpeed > 0.05
                 ? Math.toDegrees(Math.atan2(-vel.x, vel.z))
                 : lookYaw;
-
-            // 15% chance of a big look-around (60-90° sweep), otherwise a small glance
             boolean bigLook = rng.nextFloat() < 0.15f;
             double yawJitter   = bigLook ? (rng.nextDouble() * 2 - 1) * 75 : (rng.nextDouble() * 2 - 1) * 22;
             double pitchTarget = bigLook ? (rng.nextDouble() * 55 - 20) : (rng.nextDouble() * 18 - 5);
-
             targetYaw   = baseYaw + yawJitter;
             targetPitch = Math.max(-75, Math.min(60, pitchTarget));
-
-            // Hold the new target for 1.5–5 s
             lookHoldTicks = 30 + rng.nextInt(70);
         }
         lookHoldTicks--;
 
-        // Lerp at 6%/tick — smooth enough that a 90° turn takes ~2 s
         lookYaw   += (targetYaw   - lookYaw)   * 0.06;
         lookPitch += (targetPitch - lookPitch)  * 0.06;
 
@@ -160,7 +192,6 @@ public class BotModule {
 
     // ── Torch placement ───────────────────────────────────────────────────────
 
-    /** Called every tick; fires the actual check only every 100 ticks (5 s). */
     private void tickTorchCheck(MinecraftClient mc) {
         if (useFreeLook || mc.player == null || mc.world == null) return;
         if (++torchCheckTicks < 100) return;
@@ -183,7 +214,6 @@ public class BotModule {
         Direction left   = facing.rotateYCounterclockwise();
         Direction right  = facing.rotateYClockwise();
 
-        // Prefer wall to left / right (less likely to be in Baritone's path), floor last
         for (Direction wallDir : new Direction[]{left, right}) {
             for (int dy : new int[]{1, 0}) {
                 BlockPos wallBlock  = pos.up(dy).offset(wallDir);
@@ -194,7 +224,6 @@ public class BotModule {
                 }
             }
         }
-        // Floor fallback
         BlockPos below = pos.down();
         if (mc.world.getBlockState(below).isSolidBlock(mc.world, below) && mc.world.getBlockState(pos).isAir()) {
             placeTorch(mc, torchSlot, below, Direction.UP);
@@ -212,13 +241,12 @@ public class BotModule {
         return result.isAccepted();
     }
 
-    // ── Global Baritone settings (applied on start) ───────────────────────────
+    // ── Global Baritone settings ──────────────────────────────────────────────
 
     private void applyGlobalSettings() {
         MinecraftClient.getInstance().execute(() -> {
             var s = BaritoneAPI.getSettings();
 
-            // Rendering — all off so nothing overlays the video
             s.renderPath.value              = false;
             s.renderGoal.value              = false;
             s.renderGoalAnimated.value      = false;
@@ -228,22 +256,16 @@ public class BotModule {
             s.renderCachedChunks.value      = false;
             s.fadePath.value                = false;
 
-            // Look — smooth Baritone turns for survival; creative overrides with freeLook+onTick
             s.smoothLook.value              = true;
-            s.smoothLookTicks.value         = 18;   // ~0.9 s to complete a turn
-            s.randomLooking.value           = 0.18; // small random jitter per tick
+            s.smoothLookTicks.value         = 18;
+            s.randomLooking.value           = 0.18;
             s.randomLooking113.value        = 0.10;
-            s.freeLook.value                = false; // creative survey overrides this to true
+            s.freeLook.value                = false;
 
-            // Doors: Baritone naturally opens doors when pathfinding through them.
-
-            // Don't warp into nether portals during automated runs
             s.enterPortal.value             = false;
-
-            // Movement
             s.allowSprint.value             = true;
             s.sprintAscends.value           = true;
-            s.notificationOnPathComplete.value = false; // suppress chat spam
+            s.notificationOnPathComplete.value = false;
         });
     }
 
@@ -251,16 +273,14 @@ public class BotModule {
 
     private void runCreativeSurvey() throws InterruptedException {
         waitForPlayer();
-
-        // Enable creative flight so Baritone uses 3D pathfinding instead of walking
         MinecraftClient mc = MinecraftClient.getInstance();
         mc.execute(() -> {
             if (mc.player != null) {
                 mc.player.getAbilities().flying = true;
                 mc.player.sendAbilitiesUpdate();
                 BaritoneAPI.getSettings().allowPlace.value  = false;
-                BaritoneAPI.getSettings().allowBreak.value  = true;  // break anything in flight path
-                BaritoneAPI.getSettings().freeLook.value    = true;  // we drive look in onTick
+                BaritoneAPI.getSettings().allowBreak.value  = true;
+                BaritoneAPI.getSettings().freeLook.value    = true;
             }
         });
         useFreeLook     = true;
@@ -284,27 +304,85 @@ public class BotModule {
     private static final Block[] SURFACE_ORES = {
         Blocks.COAL_ORE, Blocks.IRON_ORE, Blocks.COPPER_ORE,
     };
-    // Village interior proxy — breaking these forces the bot into house interiors
-    private static final Block[] VILLAGE_BLOCKS = {
-        Blocks.WHITE_BED, Blocks.ORANGE_BED, Blocks.MAGENTA_BED, Blocks.LIGHT_BLUE_BED,
-        Blocks.YELLOW_BED, Blocks.LIME_BED, Blocks.PINK_BED, Blocks.GRAY_BED,
-        Blocks.LIGHT_GRAY_BED, Blocks.CYAN_BED, Blocks.PURPLE_BED, Blocks.BLUE_BED,
-        Blocks.BROWN_BED, Blocks.GREEN_BED, Blocks.RED_BED, Blocks.BLACK_BED,
-        Blocks.BOOKSHELF,
-        Blocks.OAK_PRESSURE_PLATE, Blocks.STONE_PRESSURE_PLATE,
-        Blocks.SPRUCE_PRESSURE_PLATE, Blocks.BIRCH_PRESSURE_PLATE,
-    };
-
-    // No deepslate in the beta datapack — standard ore blocks only
     private static final Block[] DEEP_ORES = {
         Blocks.IRON_ORE, Blocks.GOLD_ORE, Blocks.REDSTONE_ORE,
         Blocks.LAPIS_ORE, Blocks.DIAMOND_ORE,
     };
 
+    /**
+     * Structure-interior signature blocks.  Presence within 24 blocks indicates
+     * the bot is near an interior space worth exploring.
+     *
+     * Covers: village, pillager outpost, woodland mansion, stronghold,
+     *         dungeon, mineshaft, jungle/desert temple.
+     */
+    private static final Block[] INTERIOR_BLOCKS = {
+        // Village — beds (all 16 colours)
+        Blocks.WHITE_BED, Blocks.ORANGE_BED, Blocks.MAGENTA_BED, Blocks.LIGHT_BLUE_BED,
+        Blocks.YELLOW_BED, Blocks.LIME_BED, Blocks.PINK_BED, Blocks.GRAY_BED,
+        Blocks.LIGHT_GRAY_BED, Blocks.CYAN_BED, Blocks.PURPLE_BED, Blocks.BLUE_BED,
+        Blocks.BROWN_BED, Blocks.GREEN_BED, Blocks.RED_BED, Blocks.BLACK_BED,
+        // Village / stronghold
+        Blocks.BOOKSHELF,
+        Blocks.OAK_PRESSURE_PLATE, Blocks.STONE_PRESSURE_PLATE,
+        Blocks.SPRUCE_PRESSURE_PLATE, Blocks.BIRCH_PRESSURE_PLATE,
+        // Dungeon / mineshaft
+        Blocks.SPAWNER,
+        Blocks.RAIL, Blocks.COBWEB,
+        // Stronghold
+        Blocks.END_PORTAL_FRAME, Blocks.IRON_BARS, Blocks.MOSSY_STONE_BRICKS,
+        // Jungle temple
+        Blocks.TRIPWIRE_HOOK,
+        // Pillager outpost / woodland mansion
+        Blocks.DARK_OAK_PLANKS,
+    };
+
+    private void runSurvivalGather() throws InterruptedException {
+        waitForPlayer();
+        MinecraftClient.getInstance().execute(() -> {
+            BaritoneAPI.getSettings().allowBreak.value = true;
+            BaritoneAPI.getSettings().allowPlace.value = true;
+        });
+
+        int cycle = 0;
+        while (running.get()) {
+            cycle++;
+            log("§a[Bot] Survival cycle " + cycle);
+
+            explore(150);
+            if (!running.get()) break;
+
+            mine(WOOD, 24, 180);
+            if (!running.get()) break;
+
+            mine(SURFACE_ORES, 16, 180);
+            if (!running.get()) break;
+
+            log("§a[Bot] Descending underground…");
+            descend(12, 150);
+            if (!running.get()) break;
+
+            mine(DEEP_ORES, 24, 360);
+            if (!running.get()) break;
+
+            explore(120);
+            if (!running.get()) break;
+
+            log("§a[Bot] Returning to surface…");
+            descend(70, 150);
+            if (!running.get()) break;
+        }
+    }
+
+    private void descend(int targetY, int maxSeconds) throws InterruptedException {
+        MinecraftClient.getInstance().execute(() ->
+            baritone().getCustomGoalProcess().setGoalAndPath(new GoalYLevel(targetY)));
+        awaitProcess(baritone().getCustomGoalProcess(), maxSeconds);
+    }
+
     // ── Void scatter ──────────────────────────────────────────────────────────
 
-    // Mirror of VoidScatterGenerator.SCATTER_MATERIALS (Java server) and
-    // block_vocab.py :: SCATTER_BLOCKS (Python pipeline).
+    // Mirror of VoidScatterGenerator.SCATTER_MATERIALS and block_vocab.py::SCATTER_BLOCKS.
     private static final Block[] VOID_SCATTER_BLOCKS = {
         Blocks.STONE, Blocks.COBBLESTONE, Blocks.DIRT, Blocks.GRASS_BLOCK,
         Blocks.SAND, Blocks.GRAVEL, Blocks.CLAY, Blocks.SANDSTONE,
@@ -334,7 +412,7 @@ public class BotModule {
 
     private void runVoidScatter() throws InterruptedException {
         waitForPlayer();
-        // Baritone resets its settings on new server connection — wait for that to fire first
+        // Baritone resets settings on new server connection — wait for that first
         Thread.sleep(3000);
         MinecraftClient.getInstance().execute(() -> {
             var s = BaritoneAPI.getSettings();
@@ -343,32 +421,18 @@ public class BotModule {
             s.allowParkour.value       = false;
             s.allowParkourPlace.value  = false;
             s.allowParkourAscend.value = false;
-            // Let Baritone scaffold with any block in the void scatter inventory
             java.util.List<net.minecraft.item.Item> throwaway = new java.util.ArrayList<>();
             for (Block b : VOID_SCATTER_BLOCKS) {
                 net.minecraft.item.Item item = b.asItem();
-                if (item != net.minecraft.item.Items.AIR) throwaway.add(item);
+                if (item != Items.AIR) throwaway.add(item);
             }
             s.acceptableThrowawayItems.value = throwaway;
         });
 
-        int step = 0;
+        // The new world has a connected path; just explore it.
+        // Staircases and branches are baked into the world gen — no Y-goal stepping needed.
         while (running.get()) {
-            if (step % 5 == 4) {
-                MinecraftClient mc = MinecraftClient.getInstance();
-                if (mc.player != null) {
-                    int y = 10 + rng.nextInt(100);
-                    log("§d[Bot] Void ↕ y=" + y);
-                    mc.execute(() -> baritone().getCustomGoalProcess()
-                        .setGoalAndPath(new GoalYLevel(y)));
-                    awaitProcess(baritone().getCustomGoalProcess(), 20);
-                    // Brief pause after Y goal (success or failure) before next phase
-                    Thread.sleep(5_000);
-                }
-            } else {
-                exploreVoid(40);
-            }
-            step++;
+            exploreVoid(60);
         }
     }
 
@@ -384,52 +448,6 @@ public class BotModule {
         Thread.sleep(300);
     }
 
-    private void runSurvivalGather() throws InterruptedException {
-        waitForPlayer();
-        MinecraftClient.getInstance().execute(() -> {
-            BaritoneAPI.getSettings().allowBreak.value = true;
-            BaritoneAPI.getSettings().allowPlace.value = true;
-        });
-
-        int cycle = 0;
-        while (running.get()) {
-            cycle++;
-            log("§a[Bot] Survival cycle " + cycle);
-
-            // Long surface sweep — loads new terrain, finds villages
-            explore(150);
-            if (!running.get()) break;
-
-            mine(WOOD, 24, 180);
-            if (!running.get()) break;
-
-            mine(SURFACE_ORES, 16, 180);
-            if (!running.get()) break;
-
-            // Descend underground
-            log("§a[Bot] Descending underground…");
-            descend(12, 150);
-            if (!running.get()) break;
-
-            mine(DEEP_ORES, 24, 360);
-            if (!running.get()) break;
-
-            explore(120);
-            if (!running.get()) break;
-
-            log("§a[Bot] Returning to surface…");
-            descend(70, 150);
-            if (!running.get()) break;
-        }
-    }
-
-    /** Path to a target Y level (descend or ascend). Baritone will find cave passages or dig. */
-    private void descend(int targetY, int maxSeconds) throws InterruptedException {
-        MinecraftClient.getInstance().execute(() ->
-            baritone().getCustomGoalProcess().setGoalAndPath(new GoalYLevel(targetY)));
-        awaitProcess(baritone().getCustomGoalProcess(), maxSeconds);
-    }
-
     // ── Shared helpers ────────────────────────────────────────────────────────
 
     private void mine(Block[] blocks, int quantity, int maxSeconds) throws InterruptedException {
@@ -438,18 +456,43 @@ public class BotModule {
         awaitProcess(baritone().getMineProcess(), maxSeconds);
     }
 
+    /**
+     * Explore for up to {@code seconds}.
+     *
+     * Priority order:
+     *   1. Lodestone structure hints (positions from the "blockscope:structures" channel)
+     *   2. Local interior-block detection (INTERIOR_BLOCKS within 24 blocks)
+     *   3. Baritone's explore process (default)
+     *
+     * This means the bot exploits server-provided structure locations when available,
+     * falls back to heuristic detection when Lodestone is absent, and always has a
+     * default movement strategy.
+     */
     private void explore(int seconds) throws InterruptedException {
+        // 1. Lodestone structure hint
+        BlockPos hint = structureHints.poll();
+        if (hint != null) {
+            log("§e[Bot] Structure hint → (" + hint.getX() + ", " + hint.getZ() + ")");
+            MinecraftClient.getInstance().execute(() ->
+                baritone().getCustomGoalProcess().setGoalAndPath(
+                    new GoalXZ(hint.getX(), hint.getZ())));
+            awaitProcess(baritone().getCustomGoalProcess(), Math.min(seconds, 120));
+            return;
+        }
+
+        // 2. Default: Baritone explore, scanning every 10 s for local interior blocks
         log("§b[Bot] Exploring for " + seconds + "s…");
         MinecraftClient mc = MinecraftClient.getInstance();
         mc.execute(() -> baritone().getExploreProcess()
             .explore(mc.player.getBlockX(), mc.player.getBlockZ()));
+
         for (int i = 0; i < seconds && running.get(); i++) {
             Thread.sleep(1_000);
-            if (i % 10 == 9 && hasNearbyVillageBlocks()) {
-                log("§e[Bot] Village interior detected — breaking in");
+            if (i % 10 == 9 && hasNearbyInteriorBlocks()) {
+                log("§e[Bot] Interior detected — navigating in");
                 cancelBaritone();
                 Thread.sleep(200);
-                mine(VILLAGE_BLOCKS, 8, 120);
+                mine(INTERIOR_BLOCKS, 8, 120);
                 return;
             }
         }
@@ -458,28 +501,29 @@ public class BotModule {
     }
 
     /**
-     * Wait for a Baritone process to finish, but every 10 seconds scan for nearby
-     * village interior blocks (beds, bookshelves, pressure plates). If found,
-     * cancel the current task and mine them — forcing the bot inside buildings —
-     * then hand control back to the caller.
+     * Wait for a Baritone process, scanning for interior blocks every 10 s.
+     * Cancels the current task and digs into the interior if signature blocks are found.
      */
     private void awaitProcess(IBaritoneProcess process, int maxSeconds) throws InterruptedException {
         for (int i = 0; i < maxSeconds * 2 && running.get(); i++) {
             Thread.sleep(500);
             if (!process.isActive()) return;
-            // Every 10 s check for village interior blocks within 24 blocks
-            if (i % 20 == 19 && hasNearbyVillageBlocks()) {
-                log("§e[Bot] Village interior detected — breaking in");
+            if (i % 20 == 19 && hasNearbyInteriorBlocks()) {
+                log("§e[Bot] Interior detected — navigating in");
                 cancelBaritone();
                 Thread.sleep(200);
-                mine(VILLAGE_BLOCKS, 8, 120);
-                return; // caller's phase continues on next iteration
+                mine(INTERIOR_BLOCKS, 8, 120);
+                return;
             }
         }
     }
 
-    /** Scan a 24-block radius for any VILLAGE_BLOCKS (beds, bookshelves, pressure plates). */
-    private boolean hasNearbyVillageBlocks() {
+    /**
+     * Scan a 24-block radius for interior signature blocks (beds, rails, spawner, etc.).
+     * Returns true if any INTERIOR_BLOCKS are found nearby — used to trigger
+     * a targeted interior-exploration detour regardless of Lodestone availability.
+     */
+    private boolean hasNearbyInteriorBlocks() {
         MinecraftClient mc = MinecraftClient.getInstance();
         if (mc.player == null || mc.world == null) return false;
         int px = mc.player.getBlockX(), py = mc.player.getBlockY(), pz = mc.player.getBlockZ();
@@ -487,15 +531,11 @@ public class BotModule {
             for (int dy = -4; dy <= 4; dy++) {
                 for (int dz = -24; dz <= 24; dz += 3) {
                     Block b = mc.world.getBlockState(new BlockPos(px+dx, py+dy, pz+dz)).getBlock();
-                    for (Block vb : VILLAGE_BLOCKS) if (b == vb) return true;
+                    for (Block sig : INTERIOR_BLOCKS) if (b == sig) return true;
                 }
             }
         }
         return false;
-    }
-
-    private void sleepSeconds(int seconds) throws InterruptedException {
-        for (int i = 0; i < seconds && running.get(); i++) Thread.sleep(1_000);
     }
 
     private void waitForPlayer() throws InterruptedException {

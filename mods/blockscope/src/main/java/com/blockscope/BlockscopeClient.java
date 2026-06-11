@@ -87,6 +87,7 @@ public class BlockscopeClient implements ClientModInitializer {
 
         baritonePresent = FabricLoader.getInstance().isModLoaded("baritone");
         if (baritonePresent) {
+            BotModule.init();
             botToggleKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
                 "key.blockscope.bot_toggle",
                 InputUtil.Type.KEYSYM,
