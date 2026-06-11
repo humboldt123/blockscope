@@ -1,11 +1,13 @@
 package com.blockscope.lodestone;
 
+import com.blockscope.lodestone.generator.LegacyChunkGenerator;
 import org.bukkit.*;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.entity.Player;
 import org.bukkit.generator.structure.Structure;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
+import org.bukkit.event.entity.EntityDamageEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.world.WorldInitEvent;
@@ -37,14 +39,24 @@ public class SessionManager implements Listener {
     private final boolean toolRandomisation;
     private final int toolCheckIntervalTicks;
     private final boolean survivalEnabled;
-    private final boolean voidScatterEnabled;
+    private final boolean voidEnabled;
+    private final boolean hermitcraftEnabled;
     private final boolean baritoneControlEnabled;
+    private final org.bukkit.Material[] voidPalette;
+    enum WorldType { MODERN, BETA, LEGACY_2013 }
+    private final WorldType worldType;
 
-    // Path to beta_world.zip — resolved relative to plugin data folder
-    private File betaDatapackZip;
+    // Hermitcraft worlds: persistent shared worlds, never deleted.
+    // Maps season number (5-8) -> loaded World (or null if not yet loaded).
+    private final java.util.concurrent.ConcurrentHashMap<Integer, World> hermitWorlds
+        = new java.util.concurrent.ConcurrentHashMap<>();
+    // Spawn points per season, loaded from hermitcraft/spawn_points.json
+    private final java.util.Map<Integer, java.util.List<double[]>> hermitSpawnPoints
+        = new java.util.HashMap<>();
+    private static final int[] HERMIT_SEASONS = {5, 6, 7, 8};
 
-    private final Queue<World> survivalPool     = new ConcurrentLinkedQueue<>();
-    private final Queue<World> voidScatterPool  = new ConcurrentLinkedQueue<>();
+    private final Queue<World> survivalPool = new ConcurrentLinkedQueue<>();
+    private final Queue<World> voidPool     = new ConcurrentLinkedQueue<>();
     private final Map<UUID, World> playerWorlds = new ConcurrentHashMap<>();
     private final Map<UUID, Integer> toolCheckTasks = new ConcurrentHashMap<>();
     private final Map<UUID, Integer> sessionTimers = new ConcurrentHashMap<>();
@@ -66,22 +78,18 @@ public class SessionManager implements Listener {
         this.sessionDurationSeconds = cfg.getInt("session_duration_seconds", 1800);
         this.toolRandomisation      = cfg.getBoolean("tool_randomisation_enabled", true);
         this.toolCheckIntervalTicks = cfg.getInt("tool_check_interval_seconds", 30) * 20;
-        this.survivalEnabled        = cfg.getBoolean("survival_sessions_enabled", true);
-        this.voidScatterEnabled     = cfg.getBoolean("void_scatter_sessions_enabled", true);
+        this.survivalEnabled        = cfg.getBoolean("survival_worlds", true);
+        this.voidEnabled            = cfg.getBoolean("void_worlds", true);
+        this.hermitcraftEnabled     = cfg.getBoolean("hermitcraft_worlds", false);
         this.baritoneControlEnabled = cfg.getBoolean("baritone_control_enabled", true);
+        this.voidPalette = VoidScatterGenerator.forConfig(
+            cfg.getString("void_scatter_palette", "scatter_classic"));
+        this.worldType = switch (cfg.getString("world_type", "modern").toLowerCase()) {
+            case "beta"        -> WorldType.BETA;
+            case "2013", "legacy_2013" -> WorldType.LEGACY_2013;
+            default            -> WorldType.MODERN;
+        };
 
-        // Look for beta_world.zip next to the plugin jar (in plugins/ folder)
-        betaDatapackZip = new File(plugin.getDataFolder().getParentFile(), "beta_world.zip");
-        if (!betaDatapackZip.exists()) {
-            // Also check server root
-            betaDatapackZip = new File(Bukkit.getWorldContainer().getParentFile(), "beta_world.zip");
-        }
-        if (!betaDatapackZip.exists()) {
-            plugin.getLogger().warning("beta_world.zip not found — worlds will generate without beta datapack!");
-            betaDatapackZip = null;
-        } else {
-            plugin.getLogger().info("Beta datapack found: " + betaDatapackZip.getAbsolutePath());
-        }
     }
 
     // ── World pool ─────────────────────────────────────────────────────────────
@@ -89,30 +97,150 @@ public class SessionManager implements Listener {
     public void startWorldPool() {
         plugin.getServer().getMessenger().registerOutgoingPluginChannel(plugin, SESSION_CHANNEL);
         ensureDatapackInMainWorld();
+        if (hermitcraftEnabled) {
+            loadHermitSpawnPoints();
+            bgPool.submit(this::loadHermitcraftWorlds);
+        }
         refillPool();
     }
 
+    private void loadHermitSpawnPoints() {
+        java.io.File spawnFile = new java.io.File("hermitcraft/spawn_points.json");
+        if (!spawnFile.exists()) {
+            plugin.getLogger().warning("Hermitcraft spawn_points.json not found at " + spawnFile.getAbsolutePath());
+            return;
+        }
+        try (java.io.FileReader r = new java.io.FileReader(spawnFile)) {
+            // Parse JSON manually (no Gson dependency — use Bukkit's bundled approach)
+            org.bukkit.configuration.file.YamlConfiguration dummy; // just for context
+            String json = new String(java.nio.file.Files.readAllBytes(spawnFile.toPath()));
+            // Simple parse: {"5": [[x,y,z],...], "6": [...], ...}
+            for (int s : HERMIT_SEASONS) {
+                java.util.List<double[]> pts = new java.util.ArrayList<>();
+                String marker = "\"" + s + "\":[";
+                int start = json.indexOf(marker);
+                if (start < 0) continue;
+                start += marker.length();
+                int depth = 1;
+                StringBuilder buf = new StringBuilder("[");
+                for (int i = start; i < json.length() && depth > 0; i++) {
+                    char c = json.charAt(i);
+                    if (c == '[') depth++;
+                    else if (c == ']') { depth--; if (depth == 0) break; }
+                    buf.append(c);
+                }
+                buf.append("]");
+                // Parse [[x,y,z],...] from buf
+                String list = buf.toString().replaceAll("\\s","");
+                for (String triple : list.substring(2, list.length()-2).split("\\],\\[")) {
+                    String[] parts = triple.split(",");
+                    if (parts.length == 3)
+                        pts.add(new double[]{Double.parseDouble(parts[0]),
+                                             Double.parseDouble(parts[1]),
+                                             Double.parseDouble(parts[2])});
+                }
+                hermitSpawnPoints.put(s, pts);
+                plugin.getLogger().info("Hermitcraft S" + s + ": " + pts.size() + " spawn points loaded");
+            }
+        } catch (Exception e) {
+            plugin.getLogger().severe("Failed to load hermitcraft spawn points: " + e.getMessage());
+        }
+    }
+
+    private void loadHermitcraftWorlds() {
+        java.io.File hermitBase = new java.io.File("hermitcraft");
+        for (int s : HERMIT_SEASONS) {
+            java.io.File worldDir = new java.io.File(hermitBase, "hermitcraft" + s);
+            if (!worldDir.exists()) {
+                plugin.getLogger().warning("Hermitcraft S" + s + " world not found at " + worldDir);
+                continue;
+            }
+            // Symlink the world into the server's world container so Paper can load it
+            // without copying 3+ GB. Remove session.lock first.
+            java.io.File dest = new java.io.File("hc" + s);
+            if (!dest.exists()) {
+                try {
+                    java.nio.file.Files.createSymbolicLink(dest.toPath(), worldDir.toPath().toAbsolutePath());
+                    plugin.getLogger().info("Symlinked hermitcraft S" + s + " → " + dest);
+                } catch (Exception e) {
+                    plugin.getLogger().severe("Failed to symlink hc" + s + ": " + e.getMessage());
+                    continue;
+                }
+            }
+            new java.io.File(dest, "session.lock").delete();
+            CompletableFuture<World> f = new CompletableFuture<>();
+            Bukkit.getScheduler().runTask(plugin, () -> {
+                try {
+                    World w = new WorldCreator("hc" + s)
+                        .environment(World.Environment.NORMAL)
+                        .generateStructures(false)
+                        .createWorld();
+                    if (w != null) {
+                        w.setGameRule(GameRule.DO_MOB_SPAWNING, false);
+                        w.setGameRule(GameRule.DO_DAYLIGHT_CYCLE, true);
+                        w.setGameRule(GameRule.ANNOUNCE_ADVANCEMENTS, false);
+                        w.setDifficulty(Difficulty.PEACEFUL);
+                        hermitWorlds.put(s, w);
+                        plugin.getLogger().info("Hermitcraft S" + s + " loaded (" + w.getName() + ")");
+                    }
+                    f.complete(w);
+                } catch (Exception e) {
+                    plugin.getLogger().severe("Failed to load hc" + s + ": " + e.getMessage());
+                    f.complete(null);
+                }
+            });
+            try { f.get(120, TimeUnit.SECONDS); } catch (Exception ignored) {}
+        }
+    }
+
+    private void copyDir(java.io.File src, java.io.File dst) throws java.io.IOException {
+        dst.mkdirs();
+        for (java.io.File f : src.listFiles()) {
+            java.io.File d = new java.io.File(dst, f.getName());
+            if (f.isDirectory()) copyDir(f, d);
+            else java.nio.file.Files.copy(f.toPath(), d.toPath(),
+                     java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        }
+    }
+
     /**
-     * Paper uses the main world's datapack repository for all programmatically-created worlds.
-     * The per-world datapacks/ folders of custom WorldCreator worlds are NOT read.
-     * So we copy beta_world.zip into world/datapacks/ — if it isn't there already this
-     * server run started without it and we log a warning (restart required to take effect).
+     * Activate only the period-accurate datapack for the enabled session types.
+     * Paper datapacks are server-wide so only one legacy pack should be active at a time.
+     *
+     * Pack files sit in world/datapacks/:
+     *   period_accurate_beta_1_7_3.zip       — active name (Paper loads it)
+     *   period_accurate_beta_1_7_3.zip.off   — disabled name (Paper ignores it)
+     *   period_accurate_1_5_2.zip            — same pattern
+     *
+     * Changes take effect on next server restart (datapacks load at startup).
      */
     private void ensureDatapackInMainWorld() {
-        if (betaDatapackZip == null) return;
         World mainWorld = Bukkit.getWorlds().get(0);
-        File mainDatapacks = new File(mainWorld.getWorldFolder(), "datapacks");
-        mainDatapacks.mkdirs();
-        File dest = new File(mainDatapacks, "beta_world.zip");
-        if (!dest.exists()) {
-            try {
-                Files.copy(betaDatapackZip.toPath(), dest.toPath());
-                plugin.getLogger().warning("beta_world.zip copied to world/datapacks/ — RESTART server for it to take effect!");
-            } catch (IOException e) {
-                plugin.getLogger().severe("Failed to copy beta datapack to main world: " + e.getMessage());
-            }
+        File dp = new File(mainWorld.getWorldFolder(), "datapacks");
+        dp.mkdirs();
+
+        File betaOn  = new File(dp, "period_accurate_beta_1_7_3.zip");
+        File betaOff = new File(dp, "period_accurate_beta_1_7_3.zip.off");
+        File legOn   = new File(dp, "period_accurate_1_5_2.zip");
+        File legOff  = new File(dp, "period_accurate_1_5_2.zip.off");
+
+        // Activate exactly the pack matching world_type; disable the other
+        if (worldType == WorldType.BETA) {
+            if (!betaOn.exists() && betaOff.exists()) betaOff.renameTo(betaOn);
+            if (legOn.exists()) legOn.renameTo(legOff);
+        } else if (worldType == WorldType.LEGACY_2013) {
+            if (!legOn.exists() && legOff.exists()) legOff.renameTo(legOn);
+            if (betaOn.exists()) betaOn.renameTo(betaOff);
         } else {
-            plugin.getLogger().info("Beta datapack confirmed in world/datapacks/ — active.");
+            // MODERN: disable both period packs
+            if (betaOn.exists()) betaOn.renameTo(betaOff);
+            if (legOn.exists()) legOn.renameTo(legOff);
+        }
+
+        // Log current state
+        plugin.getLogger().info("Datapacks: beta=" + betaOn.exists() + " legacy2013=" + legOn.exists() + " (world_type=" + worldType + ")");
+        if (worldType != WorldType.MODERN) {
+            plugin.getLogger().info("Note: datapack changes take effect after a full server restart.");
         }
     }
 
@@ -127,12 +255,12 @@ public class SessionManager implements Listener {
                     }
                 }
             }
-            if (voidScatterEnabled) {
-                while (voidScatterPool.size() < poolSize) {
+            if (voidEnabled) {
+                while (voidPool.size() < poolSize) {
                     World w = generateVoidWorldFromBg();
                     if (w != null) {
-                        voidScatterPool.add(w);
-                        plugin.getLogger().info("World pool: void scatter world ready (" + w.getName() + "), pool size=" + voidScatterPool.size());
+                        voidPool.add(w);
+                        plugin.getLogger().info("World pool: void world ready (" + w.getName() + ") [" + worldType + "], pool size=" + voidPool.size());
                     }
                 }
             }
@@ -143,12 +271,15 @@ public class SessionManager implements Listener {
         String name = "bs_" + worldCounter.incrementAndGet() + "_" + Long.toHexString(rng.nextLong() & 0xFFFFFFL);
         long seed = rng.nextLong();
 
+        // Always use vanilla 1.19 terrain. Block palette accuracy is handled by
+        // the period-accurate datapack (world_type controls which pack is active).
         WorldCreator creator = new WorldCreator(name)
             .environment(World.Environment.NORMAL)
             .seed(seed)
             .generateStructures(true);
 
-        CompletableFuture<World> future = new CompletableFuture<>();
+        // Step 1: create world on main thread (fast, ~50ms)
+        CompletableFuture<World> createFuture = new CompletableFuture<>();
         Bukkit.getScheduler().runTask(plugin, () -> {
             try {
                 World w = creator.createWorld();
@@ -160,27 +291,33 @@ public class SessionManager implements Listener {
                     w.setGameRule(GameRule.SHOW_DEATH_MESSAGES, false);
                     w.setGameRule(GameRule.DO_IMMEDIATE_RESPAWN, true);
                     w.setTime(6000);
-                    // WorldInitEvent set spawn to (0,64,0) as a placeholder to skip
-                    // Paper's expensive setInitialSpawn spiral scan. Now that createWorld()
-                    // has returned, chunk (0,0) is loaded — correct Y to actual surface.
-                    int surfaceY = w.getHighestBlockYAt(0, 0) + 1;
-                    w.setSpawnLocation(0, surfaceY, 0);
-                    // 2/10: village  5/10: beta structure  3/10: leave at origin surface
-                    targetSpawn(w);
+                    if (worldType != WorldType.MODERN) {
+                        int surfaceY = w.getHighestBlockYAt(0, 0) + 1;
+                        w.setSpawnLocation(0, surfaceY, 0);
+                        targetSpawn(w);
+                    }
                 }
-                future.complete(w);
+                createFuture.complete(w);
             } catch (Exception e) {
                 plugin.getLogger().severe("World creation failed: " + e.getMessage());
-                future.complete(null);
+                createFuture.complete(null);
             }
         });
 
+        World w;
         try {
-            return future.get(120, TimeUnit.SECONDS);
+            w = createFuture.get(30, TimeUnit.SECONDS);
         } catch (Exception e) {
-            plugin.getLogger().warning("World generation timed out: " + e.getMessage());
+            plugin.getLogger().warning("World creation timed out: " + e.getMessage());
             return null;
         }
+        if (w == null) return null;
+
+        // Step 2: pre-generate spawn region using Paper's async chunk API.
+        // getChunkAtAsync runs on Paper's chunk worker threads — main thread stays free.
+        // bgPool thread blocks here (fine, its only job is pool management).
+        pregenerateSpawnRegion(w);
+        return w;
     }
 
     /**
@@ -250,9 +387,29 @@ public class SessionManager implements Listener {
      */
     @EventHandler
     public void onWorldInit(WorldInitEvent event) {
-        if (event.getWorld().getName().startsWith("bs_")) {
+        // For custom-generator worlds (void, legacy terrain), lock spawn at (0,64,0)
+        // so Paper skips its expensive surface-scan — the generator handles spawn itself.
+        // For MODERN vanilla worlds, let Paper find a proper non-ocean spawn naturally.
+        if (event.getWorld().getName().startsWith("bs_") && worldType != WorldType.MODERN) {
             event.getWorld().setSpawnLocation(0, 64, 0);
         }
+    }
+
+    /** In void scatter worlds, cancel void damage and teleport back to spawn instead. */
+    @EventHandler
+    public void onVoidFall(EntityDamageEvent event) {
+        if (event.getCause() != EntityDamageEvent.DamageCause.VOID) return;
+        if (!(event.getEntity() instanceof Player player)) return;
+        if (!player.getWorld().getName().startsWith("bs_")) return;
+        if (!voidEnabled) return;
+        event.setCancelled(true);
+        player.setFallDistance(0f);
+        if (!plugin.isEnabled()) return; // server shutting down — skip scheduling
+        // Defer one tick — teleporting inside a damage event corrupts physics state and freezes the player
+        Bukkit.getScheduler().runTask(plugin, () -> {
+            player.setVelocity(new org.bukkit.util.Vector(0, 0, 0));
+            player.teleport(player.getWorld().getSpawnLocation());
+        });
     }
 
     @EventHandler
@@ -261,13 +418,53 @@ public class SessionManager implements Listener {
         event.joinMessage(null);
 
         String modeStr = assignMode();
-        boolean isVoidScatter = "void_scatter".equals(modeStr);
+        boolean isVoid        = "void".equals(modeStr);
+        boolean isHermitcraft = "hermitcraft".equals(modeStr);
 
-        Queue<World> pool = isVoidScatter ? voidScatterPool : survivalPool;
+        // Hermitcraft: pick a random loaded season and spawn point — no pool needed
+        if (isHermitcraft) {
+            java.util.List<Integer> loaded = new java.util.ArrayList<>(hermitWorlds.keySet());
+            if (loaded.isEmpty()) {
+                plugin.getLogger().warning("No hermitcraft worlds loaded — falling back to survival");
+                modeStr = "survival";
+                isHermitcraft = false;
+            } else {
+                int season = loaded.get(rng.nextInt(loaded.size()));
+                World hWorld = hermitWorlds.get(season);
+                java.util.List<double[]> pts = hermitSpawnPoints.getOrDefault(season, java.util.List.of());
+                double[] pt = pts.isEmpty()
+                    ? new double[]{hWorld.getSpawnLocation().getX(), 64, hWorld.getSpawnLocation().getZ()}
+                    : pts.get(rng.nextInt(pts.size()));
+
+                playerWorlds.put(player.getUniqueId(), hWorld);
+                World finalWorld = hWorld;
+                String finalMode = "hermitcraft_s" + season;
+
+                Bukkit.getScheduler().runTask(plugin, () -> {
+                    player.getInventory().clear();
+                    player.setGameMode(GameMode.SURVIVAL);
+                    Location spawnLoc = new Location(finalWorld, pt[0], pt[1], pt[2]);
+                    player.teleport(spawnLoc);
+                    if (toolRandomisation) { giveRandomTools(player); scheduleToolCheck(player); }
+                    plugin.getLogger().info("Session: " + player.getName() + " → " + finalWorld.getName() + " [" + finalMode + "] @ " + (int)pt[0] + "," + (int)pt[1] + "," + (int)pt[2]);
+                    Bukkit.getScheduler().runTaskLater(plugin, () -> {
+                        if (player.isOnline()) sendSessionStart(player, finalMode);
+                    }, 40L);
+                });
+
+                int timerId = Bukkit.getScheduler().scheduleSyncDelayedTask(plugin,
+                    () -> { if (player.isOnline()) endSession(player, "timeout"); },
+                    (long) sessionDurationSeconds * 20L);
+                sessionTimers.put(player.getUniqueId(), timerId);
+                return;
+            }
+        }
+
+        Queue<World> pool = isVoid ? voidPool : survivalPool;
         World world = pool.poll();
         if (world == null) {
             plugin.getLogger().warning("World pool empty — generating on-demand for " + player.getName());
-            world = isVoidScatter ? generateVoidWorldSync() : generateWorldSync();
+            world = isVoid ? generateVoidWorldSync() : generateSurvivalWorldSync();
         }
         if (world == null) {
             player.kick(net.kyori.adventure.text.Component.text("§cFailed to create session world. Try again in a moment."));
@@ -279,13 +476,14 @@ public class SessionManager implements Listener {
         refillPool();
 
         World finalWorld = world;
+        String finalMode = modeStr; // capture before lambda (modeStr may have been reassigned)
 
         Bukkit.getScheduler().runTask(plugin, () -> {
             player.getInventory().clear();
             player.setGameMode(GameMode.SURVIVAL);
             player.teleport(finalWorld.getSpawnLocation());
 
-            if (isVoidScatter) {
+            if (isVoid) {
                 giveScatterInventory(player);
             } else if (toolRandomisation) {
                 giveRandomTools(player);
@@ -293,15 +491,12 @@ public class SessionManager implements Listener {
             }
 
             plugin.getLogger().info("Session: " + player.getName() +
-                " → " + finalWorld.getName() + " [" + modeStr + "]");
+                " → " + finalWorld.getName() + " [" + finalMode + "]");
 
-            // Delay session_start by 40 ticks so the client finishes loading the new
-            // world before we send the packet (teleport causes a dimension-change/respawn
-            // packet sequence; plugin messages sent mid-switch are silently dropped).
             Bukkit.getScheduler().runTaskLater(plugin, () -> {
                 if (player.isOnline()) {
-                    sendSessionStart(player, modeStr);
-                    plugin.getLogger().info("Sent session_start → " + player.getName() + " [" + modeStr + "]");
+                    sendSessionStart(player, finalMode);
+                    plugin.getLogger().info("Sent session_start → " + player.getName() + " [" + finalMode + "]");
                 }
             }, 40L);
         });
@@ -340,9 +535,15 @@ public class SessionManager implements Listener {
             player.kick(net.kyori.adventure.text.Component.text("§aSession complete — reconnecting…"));
         }
 
-        // Unload after 2 ticks to ensure the player has left the world,
-        // but don't hold the reference any longer — worlds must not pile up.
-        Bukkit.getScheduler().runTaskLater(plugin, () -> unloadAndDeleteWorld(world), 2L);
+        // Hermitcraft worlds are permanent — never unload or delete them.
+        if (hermitWorlds.containsValue(world)) {
+            World fallback = Bukkit.getWorlds().stream()
+                .filter(w -> !w.getName().startsWith("bs_") && !w.getName().startsWith("hc"))
+                .findFirst().orElse(Bukkit.getWorlds().get(0));
+            world.getPlayers().forEach(p -> p.teleport(fallback.getSpawnLocation()));
+            return;
+        }
+        Bukkit.getScheduler().runTaskLater(plugin, () -> unloadAndDeleteWorld(world), 5L);
     }
 
     private void unloadAndDeleteWorld(World world) {
@@ -350,8 +551,14 @@ public class SessionManager implements Listener {
             .filter(w -> !w.getName().startsWith("bs_"))
             .findFirst().orElse(Bukkit.getWorlds().get(0));
         world.getPlayers().forEach(p -> p.teleport(fallback.getSpawnLocation()));
-        Bukkit.unloadWorld(world, false);
-        bgPool.submit(() -> deleteDir(world.getWorldFolder()));
+        File worldFolder = world.getWorldFolder();
+        // Unload on the next tick to let the teleport complete, then delete async.
+        // Do NOT call unloadWorld on the main thread with many loaded chunks — it blocks
+        // long enough to trigger the Paper watchdog. Schedule deletion after unload.
+        Bukkit.getScheduler().runTaskLater(plugin, () -> {
+            Bukkit.unloadWorld(world, false);
+            bgPool.submit(() -> deleteDir(worldFolder));
+        }, 5L);
     }
 
     // ── Tool randomisation ─────────────────────────────────────────────────────
@@ -400,8 +607,9 @@ public class SessionManager implements Listener {
     private String assignMode() {
         java.util.List<String> modes = new java.util.ArrayList<>();
         if (survivalEnabled)    modes.add("survival");
-        if (voidScatterEnabled) modes.add("void_scatter");
-        if (modes.isEmpty())    return "survival";
+        if (voidEnabled)        modes.add("void");
+        if (hermitcraftEnabled) modes.add("hermitcraft");
+        if (modes.isEmpty()) return "survival";
         return modes.get((modeIndex++) % modes.size());
     }
 
@@ -413,7 +621,7 @@ public class SessionManager implements Listener {
             try {
                 World w = new WorldCreator(name)
                     .environment(World.Environment.NORMAL)
-                    .generator(new VoidScatterGenerator())
+                    .generator(new VoidScatterGenerator(voidPalette))
                     .generateStructures(false)
                     .createWorld();
                 if (w != null) applyVoidWorldRules(w);
@@ -432,7 +640,7 @@ public class SessionManager implements Listener {
         try {
             World w = new WorldCreator(name)
                 .environment(World.Environment.NORMAL)
-                .generator(new VoidScatterGenerator())
+                .generator(new VoidScatterGenerator(voidPalette))
                 .generateStructures(false)
                 .createWorld();
             if (w != null) applyVoidWorldRules(w);
@@ -454,7 +662,7 @@ public class SessionManager implements Listener {
     }
 
     private void giveScatterInventory(Player player) {
-        Material[] pool = VoidScatterGenerator.SCATTER_MATERIALS;
+        Material[] pool = VoidScatterGenerator.PALETTE_SCATTER_CLASSIC;
         // Fill hotbar (9 slots) with random distinct block types, 64 each
         java.util.List<Material> chosen = new java.util.ArrayList<>();
         java.util.List<Material> shuffled = new java.util.ArrayList<>(java.util.Arrays.asList(pool));
@@ -468,11 +676,78 @@ public class SessionManager implements Listener {
         }
     }
 
-    private World generateWorldSync() {
-        // on-demand fallback for survival — runs generateWorld() on bgPool (it uses runTask internally)
+    /**
+     * Pre-generates all chunks within view-distance of spawn using Paper's async
+     * chunk API. Chunk gen runs on Paper's worker threads — main thread stays free,
+     * so players already in other worlds see no lag. This bgPool thread waits for
+     * all chunks to complete before marking the world as pool-ready.
+     */
+    private void pregenerateSpawnRegion(World w) {
+        int spawnCX = w.getSpawnLocation().getBlockX() >> 4;
+        int spawnCZ = w.getSpawnLocation().getBlockZ() >> 4;
+        int radius = 8; // covers view-distance=6 plus a margin
+
+        java.util.List<CompletableFuture<org.bukkit.Chunk>> futures = new java.util.ArrayList<>();
+        for (int cx = spawnCX - radius; cx <= spawnCX + radius; cx++) {
+            for (int cz = spawnCZ - radius; cz <= spawnCZ + radius; cz++) {
+                futures.add(w.getChunkAtAsync(cx, cz));
+            }
+        }
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+        // No explicit save needed — chunks are in Paper's cache and served from memory on join.
+        plugin.getLogger().info("Pre-generated " + futures.size() + " chunks async for " + w.getName());
+    }
+
+    private World generateSurvivalWorldSync() {
         CompletableFuture<World> f = new CompletableFuture<>();
         bgPool.submit(() -> f.complete(generateWorld()));
         try { return f.get(120, TimeUnit.SECONDS); } catch (Exception e) { return null; }
+    }
+
+    private World generateLegacyWorldFromBg(LegacyChunkGenerator.Era era) {
+        String name = "bs_" + worldCounter.incrementAndGet() + "_" + Long.toHexString(rng.nextLong() & 0xFFFFFFL);
+        CompletableFuture<World> future = new CompletableFuture<>();
+        Bukkit.getScheduler().runTask(plugin, () -> {
+            try {
+                World w = new WorldCreator(name)
+                    .environment(World.Environment.NORMAL)
+                    .generator(new LegacyChunkGenerator(era))
+                    .generateStructures(false)
+                    .createWorld();
+                if (w != null) applyLegacyWorldRules(w);
+                future.complete(w);
+            } catch (Exception e) {
+                plugin.getLogger().severe("Legacy world creation failed (" + era + "): " + e.getMessage());
+                future.complete(null);
+            }
+        });
+        try { return future.get(120, TimeUnit.SECONDS); } catch (Exception e) { return null; }
+    }
+
+    private World generateLegacyWorldSync(LegacyChunkGenerator.Era era) {
+        String name = "bs_" + worldCounter.incrementAndGet() + "_" + Long.toHexString(rng.nextLong() & 0xFFFFFFL);
+        try {
+            World w = new WorldCreator(name)
+                .environment(World.Environment.NORMAL)
+                .generator(new LegacyChunkGenerator(era))
+                .generateStructures(false)
+                .createWorld();
+            if (w != null) applyLegacyWorldRules(w);
+            return w;
+        } catch (Exception e) {
+            plugin.getLogger().severe("Legacy world creation failed (" + era + "): " + e.getMessage());
+            return null;
+        }
+    }
+
+    private void applyLegacyWorldRules(World w) {
+        w.setDifficulty(Difficulty.PEACEFUL);
+        w.setGameRule(GameRule.DO_MOB_SPAWNING, false);
+        w.setGameRule(GameRule.DO_DAYLIGHT_CYCLE, true);
+        w.setTime(6000);
+        w.setGameRule(GameRule.ANNOUNCE_ADVANCEMENTS, false);
+        w.setGameRule(GameRule.SHOW_DEATH_MESSAGES, false);
+        w.setGameRule(GameRule.DO_IMMEDIATE_RESPAWN, true);
     }
 
     private void deleteDir(File dir) {
@@ -488,9 +763,9 @@ public class SessionManager implements Listener {
     public void shutdown() {
         plugin.getServer().getMessenger().unregisterOutgoingPluginChannel(plugin, SESSION_CHANNEL);
         bgPool.shutdownNow();
-        for (World w : survivalPool)    unloadAndDeleteWorld(w);
-        for (World w : voidScatterPool) unloadAndDeleteWorld(w);
+        for (World w : survivalPool) unloadAndDeleteWorld(w);
+        for (World w : voidPool)     unloadAndDeleteWorld(w);
         survivalPool.clear();
-        voidScatterPool.clear();
+        voidPool.clear();
     }
 }
