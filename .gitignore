@@ -35,6 +35,14 @@ SOLUTION_SUMMARY.md
 # Python packaging artifacts
 *.egg-info/
 
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Datapacks — generated output; source (generate.py) is tracked
+datapacks/output/
+
 # Junk
 dummy/
 hi
