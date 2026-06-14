@@ -34,6 +34,8 @@ Furnace provides the *labels*.
 | `mirror_plugin/resources/plugin.yml` | Plugin manifest. |
 | `controller/controller.js` | Single-agent Mineflayer + pathfinder harness. `walklook` and `orbit` episodes ported from solaris-engine primitives (smooth log-normal look, `gotoWithTimeout`). |
 | `controller/package.json` | Node deps (mineflayer, mineflayer-pathfinder, vec3, minecraft-data). |
+| `controller/navtest.js` | **Pure-navigation stress test** (no camera/GPU). Drives one Mineflayer+pathfinder bot through ~32 `GoalNear` targets across a dense world; measures reached/timeout/error, stuck-no-progress events, void walk-offs, deaths, time-per-target. See "Navigation stress test" below. |
+| `controller/survey_world.js` | One-shot world survey: connects a bot, samples surface heights on a grid to pick reachable nav targets at varied elevations. |
 | `scripts/setup_server.sh` | Download Paper 1.19.4, write flat/peaceful/offline config, build the plugin with `javac` (no maven on Brev — compiles against the API jar Paper unpacks on first run). |
 | `scripts/start_server.sh` | Start Paper in a detached `screen` (`mirror_paper`). |
 | `scripts/run_camera.sh` | Run the Blockscope headless image as a **baritone-free** camera on a chosen free GPU, auto-connecting to `:25599`, uploading to the local Hopper. **Refuses GPU 0** (production collector). |
@@ -109,3 +111,65 @@ CUDA_VISIBLE_DEVICES=1 /home/nvidia/.local/bin/uv run \
   screen on `:25565` is left alone.
 - Test sessions land in Hopper under their own `session_<id>` and are clearly
   identifiable (camera username `mirror_cam`).
+
+---
+
+## Navigation stress test — can pathfinder replace Baritone? (`controller/navtest.js`)
+
+A **pure-navigation** test (no camera, no GPU, no recording) to decide whether
+`mineflayer-pathfinder` paths dense/non-flat worlds well enough to drop Baritone as
+the data-collection driver. The prototype above only proved a flat world (easy);
+Baritone's known failures are dense builds (the "Fallen Kingdom" map, where the bot
+never moved at all) and void walk-offs.
+
+### Setup (DENSE build map — the actual Baritone failure case)
+
+The real **Max's Fallen Kingdom** map (1.8-era, dated 2012) was downloaded, converted
+to 1.19.4 with `tools/mc_converter/mc-converter.jar` (1169 chunks → DataVersion 3337),
+and loaded as the Paper world. `server.properties` used a **void** generator
+(`level-type=flat`, empty layers, `the_void` biome) so out-of-bounds chunks are empty
+— making walk-offs detectable. Build core force-loaded; bot run headless on Brev,
+online-mode=false, port 25599.
+
+> If a real build map is too fiddly to source, fall back to vanilla 1.19 **default**
+> terrain (NOT flat). We got the real map, so that fallback was not needed.
+
+### Run
+
+```bash
+cd ~/mirror_prototype/controller && npm install
+node survey_world.js                 # sample surface heights → pick targets
+node navtest.js --host 127.0.0.1 --port 25599 --user ctrl_bot --timeout 30
+```
+
+### Result (Fallen Kingdom, 32 targets, GoalNear radius 2, 30s/goal)
+
+| Metric | Value |
+|--------|-------|
+| Effectively reached (≤3 blocks) | **21 / 32** |
+| Timeouts | 8 (mostly long cross-map routes still making progress; 3 near-misses ≤7 blocks) |
+| Errors ("took too long to decide path") | 3 — **all** deep multi-story castle-interior climbs (Y91/108/114, +27–50 blocks up) |
+| Stuck / no-progress wedges | **0 / 32** |
+| Void walk-offs / falls | **0** |
+| Deaths | **0** |
+| Avg time per reached target | 14.3s |
+
+### Verdict: **(B) GO, with tuning.**
+
+Pathfinder is categorically better than Baritone on this exact map: **it moves, it
+explores, it never wedged, and it never walked off into the void or died** — including
+repeated multi-block climbs and 17-block descents off the castle. Baritone never moved
+at all here. The two failure buckets are both **tuning**, not capability:
+
+1. **Long-route timeouts** — the 30s/goal budget was too tight for 100–170-block
+   diagonals; the bot was still actively closing distance when cut off. Fix: scale the
+   timeout with start→goal distance, or chunk long goals.
+2. **Deep-interior "took too long to decide path"** — pathfinder's default A* node
+   budget can't fully resolve a route 27–50 blocks up through a dense multi-story
+   interior. It still climbed ~15 blocks in before erroring (no crash, no walk-off).
+   Fix: raise `thinkTimeout`, or drive deep-interior goals as a sequence of nearer
+   waypoints. For data collection (roam/explore, surface-level coverage) this is rarely
+   needed; for arbitrary deep-interior targets, add waypointing.
+
+No code change to the harness is required to **replace Baritone** for roaming
+collection; add distance-scaled timeouts + optional waypointing for deep interiors.
