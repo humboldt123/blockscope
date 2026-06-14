@@ -51,6 +51,13 @@ public class BlockscopeClient implements ClientModInitializer {
             }
         }));
 
+        // Wipe any stale ReplayMod recovery/temp state left by a previous unclean shutdown
+        // (orphan *.mcpr.tmp dirs / .no_recover markers) BEFORE ReplayMod's deferred startup
+        // recovery scan runs. This guarantees the scan finds a clean tree and never pops the
+        // "recover recording? / Minecraft has not quit normally" modal into the recorded frames.
+        RecordingManager.cleanupReplayRecoveryState(
+            net.minecraft.client.MinecraftClient.getInstance().runDirectory);
+
         replayModIntegration = new ReplayModIntegration();
         replayModIntegration.register();
         SessionProtocol.registerClient(replayModIntegration);

@@ -96,6 +96,98 @@ public class RecordingManager {
         return instance;
     }
 
+    /**
+     * The base ReplayMod recording directory we manage. Each recording is pointed at a
+     * unique per-session subdirectory of this (see {@link #beginReplaySession()}), so
+     * ReplayMod's one-time startup recovery scan (ReplayFilesService.initialScan) — which
+     * fires post-resource-load, around the same time the headless client auto-connects and
+     * begins recording — can never see, move, or "recover" a LIVE {@code .mcpr.tmp}.
+     */
+    private static final String REPLAY_BASE_DIR = "replay_recordings";
+
+    /** ReplayMod recording path (relative to the MC run dir) for the current replay session. */
+    private volatile String replaySessionPath = null;
+
+    /**
+     * Root cause of BOTH the "recover recording? / Minecraft has not quit normally" modal AND
+     * the .mcpr FileNotFoundException-on-save: ReplayMod's deferred {@code initialScan()} runs
+     * after the loading overlay clears (i.e. right as we auto-connect + start recording). It
+     * (1) MOVES every {@code *.mcpr.tmp} out of {@code <replayFolder>/recording/} into the
+     * replay root and (2) offers a recovery prompt for any orphan {@code .mcpr.tmp} lacking a
+     * {@code .no_recover} sibling. If it catches the live recording's temp dir it yanks
+     * {@code .tmp/changed/} out from under the active writer (→ FileNotFoundException) and pops
+     * the modal into the recorded frames.
+     *
+     * <p>Defense in depth, called once at mod init BEFORE anything records:
+     * wipe any stale recovery/temp state in the base replay dir so the single deferred
+     * {@code initialScan} runs against a clean tree and is a harmless no-op. Combined with
+     * per-session recording paths ({@link #beginReplaySession()}), the scan never races a live
+     * recording again.
+     */
+    public static void cleanupReplayRecoveryState(File runDir) {
+        try {
+            File base = new File(runDir, REPLAY_BASE_DIR);
+            if (!base.exists()) return;
+            int wiped = wipeRecoveryArtifacts(base, 0);
+            if (wiped > 0) {
+                System.out.println("[Blockscope] Cleared " + wiped +
+                    " stale ReplayMod recovery/temp artifact(s) from " + base);
+            }
+        } catch (Exception e) {
+            System.err.println("[Blockscope] Replay recovery cleanup failed: " + e.getMessage());
+        }
+    }
+
+    private static int wipeRecoveryArtifacts(File dir, int depth) {
+        if (depth > 4) return 0;
+        File[] entries = dir.listFiles();
+        if (entries == null) return 0;
+        int count = 0;
+        for (File f : entries) {
+            String n = f.getName();
+            // Leftover ZipReplayFile temp dirs and crash/recovery markers — the exact things
+            // initialScan would otherwise move or turn into a recovery modal.
+            if (n.endsWith(".mcpr.tmp") || n.endsWith(".mcpr.cache") || n.endsWith(".mcpr.del")
+                    || n.endsWith(".no_recover")) {
+                deleteRecursively(f);
+                count++;
+            } else if (f.isDirectory()) {
+                count += wipeRecoveryArtifacts(f, depth + 1);
+            }
+        }
+        return count;
+    }
+
+    private static void deleteRecursively(File f) {
+        File[] kids = f.listFiles();
+        if (kids != null) for (File k : kids) deleteRecursively(k);
+        if (!f.delete()) f.deleteOnExit();
+    }
+
+    /**
+     * Point ReplayMod at a fresh, unique per-session recording directory and make sure it's
+     * empty. MUST be called immediately before {@code ReplayModRecording.initiateRecording()}
+     * so the live {@code .mcpr} / {@code .mcpr.tmp} land in their own isolated subtree that the
+     * one-time startup scan never touches. Returns the absolute path of the replay folder so
+     * the .mcpr watcher knows where to look.
+     */
+    public String beginReplaySession() {
+        try {
+            String rel = "./" + REPLAY_BASE_DIR + "/rec_" + Instant.now().getEpochSecond() + "/";
+            replaySessionPath = rel;
+            ReplayMod.instance.getSettingsRegistry().set(
+                com.replaymod.core.Setting.RECORDING_PATH, rel);
+            // getReplayFolder() reads RECORDING_PATH live and ensures the dir exists.
+            String abs = ReplayMod.instance.folders.getReplayFolder().toAbsolutePath().toString();
+            System.out.println("[Blockscope] ReplayMod recording path -> " + abs +
+                " (isolated from startup recovery scan)");
+            return abs;
+        } catch (Exception e) {
+            System.err.println("[Blockscope] Could not set per-session replay path: " + e.getMessage());
+            return null;
+        }
+    }
+
     public void startRecording(String replayFolder) {
         if (isRecording.get()) return;
 

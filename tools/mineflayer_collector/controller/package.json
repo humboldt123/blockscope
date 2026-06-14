@@ -1,0 +1,13 @@
+{
+  "name": "blockscope-mirror-controller",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Single-agent Mineflayer controller for the Blockscope mirrored-camera production collector (MC 1.19.4).",
+  "main": "controller.js",
+  "dependencies": {
+    "mineflayer": "^4.20.1",
+    "mineflayer-pathfinder": "^2.4.5",
+    "vec3": "^0.1.8",
+    "minecraft-data": "^3.55.0"
+  }
+}

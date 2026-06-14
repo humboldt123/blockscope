@@ -74,7 +74,12 @@ public class ReplayModIntegration {
             if (mod == null) return;
             PacketListener listener = mod.getConnectionEventHandler().getPacketListener();
             if (listener == null) {
-                // Not recording — start it
+                // Not recording — start it.
+                // CRITICAL: switch ReplayMod to a fresh per-session recording dir BEFORE
+                // initiateRecording() creates the .mcpr.tmp, so ReplayMod's one-time startup
+                // recovery scan can never move/recover this live recording — the shared root
+                // cause of both the recovery modal and the .mcpr save FileNotFoundException.
+                RecordingManager.getInstance().beginReplaySession();
                 ClientPlayNetworkHandler networkHandler = MinecraftClient.getInstance().getNetworkHandler();
                 if (networkHandler != null) {
                     ClientConnection connection = networkHandler.getConnection();
