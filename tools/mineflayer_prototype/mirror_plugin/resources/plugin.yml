@@ -1,0 +1,13 @@
+name: BlockscopeMirror
+version: 0.1.0
+main: me.blockscope.mirror.MirrorPlugin
+api-version: "1.19"
+author: blockscope
+description: Teleport-mirror a camera player onto a controller player and trigger Blockscope recording.
+commands:
+  mirror:
+    description: Pair controller -> camera, or 'stop' to unpair.
+    usage: /mirror <controller> <camera> | /mirror stop
+  startcam:
+    description: Send blockscope:session_start to the paired camera to begin recording.
+    usage: /startcam [seconds]
