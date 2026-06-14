@@ -1,0 +1,46 @@
+plugins {
+    id 'java'
+    id 'application'
+}
+
+group = 'blockscope'
+version = '1.0.0'
+
+repositories {
+    mavenCentral()
+    maven { url 'https://jitpack.io' }
+}
+
+dependencies {
+    implementation 'com.github.Querz:NBT:6.1'
+    implementation 'com.google.code.gson:gson:2.10.1'
+}
+
+application {
+    mainClass = 'blockscope.converter.Main'
+}
+
+// Fat jar — everything bundled, just run it
+jar {
+    manifest { attributes 'Main-Class': 'blockscope.converter.Main' }
+    from { configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) } }
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    archiveFileName = 'mc-converter.jar'
+}
+
+// Download WorldEdit's legacy.json (canonical 1.8 block ID → 1.13 block state mapping)
+task downloadLegacyJson {
+    def dest = file('src/main/resources/legacy.json')
+    outputs.file(dest)
+    doLast {
+        if (!dest.exists()) {
+            dest.parentFile.mkdirs()
+            new URL('https://raw.githubusercontent.com/EngineHub/WorldEdit/master/worldedit-core/src/main/resources/com/sk89q/worldedit/world/registry/legacy.json')
+                .withInputStream { i -> dest.withOutputStream { it << i } }
+            println 'Downloaded legacy.json'
+        }
+    }
+}
+
+processResources.dependsOn downloadLegacyJson
+compileJava.dependsOn downloadLegacyJson
