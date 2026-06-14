@@ -22,6 +22,16 @@ public class LodestonePlugin extends JavaPlugin {
         getServer().getPluginManager().registerEvents(connectionGuard, this);
         getServer().getPluginManager().registerEvents(sessionManager, this);
 
+        SpawnCommand spawnCommand = new SpawnCommand(this, sessionManager);
+        getCommand("spawn").setExecutor(spawnCommand);
+        getCommand("spawn").setTabCompleter(spawnCommand);
+        getCommand("spoofspawn").setExecutor(spawnCommand);
+
+        MapCommand mapCommand = new MapCommand(sessionManager);
+        getCommand("maps").setExecutor(mapCommand);
+        getCommand("visit").setExecutor(mapCommand);
+        getCommand("visit").setTabCompleter(mapCommand);
+
         sessionManager.startWorldPool();
         getLogger().info("Lodestone enabled.");
     }

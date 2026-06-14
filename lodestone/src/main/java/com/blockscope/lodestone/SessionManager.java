@@ -40,23 +40,40 @@ public class SessionManager implements Listener {
     private final int toolCheckIntervalTicks;
     private final boolean survivalEnabled;
     private final boolean voidEnabled;
-    private final boolean hermitcraftEnabled;
+    private final boolean libraryEnabled;
     private final boolean baritoneControlEnabled;
     private final org.bukkit.Material[] voidPalette;
+    // SOURCE world names (case-insensitive) served in ADVENTURE mode — the bot can't
+    // break, preserving the most valuable maps. Everything else stays SURVIVAL.
+    private final java.util.Set<String> adventureMaps;
+    // Source-name substrings whose maps are sky-islands: bot bridges across void (gets
+    // cobblestone + allowPlace). Matched as substrings so "skywars"/"bedwars" cover all.
+    private final java.util.List<String> bridgeMaps;
     enum WorldType { MODERN, BETA, LEGACY_2013 }
     private final WorldType worldType;
 
-    // Hermitcraft worlds: persistent shared worlds, never deleted.
-    // Maps season number (5-8) -> loaded World (or null if not yet loaded).
-    private final java.util.concurrent.ConcurrentHashMap<Integer, World> hermitWorlds
+    // Library worlds: pre-built converted maps (build maps + hermitcraft) under
+    // map_library/. Served copy-on-join in ADVENTURE mode so the bot walks the
+    // build without modifying it, and each session gets a throwaway copy that is
+    // deleted on disconnect (the original source is never touched).
+    private static final String LIBRARY_DIR = "map_library";
+    // Discovered source world dirs (each contains a converted level.dat).
+    private final java.util.List<File> librarySources = new java.util.ArrayList<>();
+    // Spawn candidates per SOURCE world name, loaded from spawn_candidates.json.
+    private final java.util.Map<String, java.util.List<SpawnPoint>> sourceSpawns
         = new java.util.concurrent.ConcurrentHashMap<>();
-    // Spawn points per season, loaded from hermitcraft/spawn_points.json
-    private final java.util.Map<Integer, java.util.List<double[]>> hermitSpawnPoints
-        = new java.util.HashMap<>();
-    private static final int[] HERMIT_SEASONS = {5, 6, 7, 8};
+    // Spawn candidates for each pooled COPY, keyed by the copy's world name.
+    // NOTE: a copy shares the SAME list reference as its source (see copyLibraryWorld),
+    // so in-game spawn edits via /spawn mutate both consistently.
+    private final java.util.Map<String, java.util.List<SpawnPoint>> librarySpawns
+        = new java.util.concurrent.ConcurrentHashMap<>();
+    // Which source world each pooled COPY was made from (for diagnostics logging).
+    private final java.util.Map<String, String> librarySource
+        = new java.util.concurrent.ConcurrentHashMap<>();
 
     private final Queue<World> survivalPool = new ConcurrentLinkedQueue<>();
     private final Queue<World> voidPool     = new ConcurrentLinkedQueue<>();
+    private final Queue<World> libraryPool  = new ConcurrentLinkedQueue<>();
     private final Map<UUID, World> playerWorlds = new ConcurrentHashMap<>();
     private final Map<UUID, Integer> toolCheckTasks = new ConcurrentHashMap<>();
     private final Map<UUID, Integer> sessionTimers = new ConcurrentHashMap<>();
@@ -78,12 +95,24 @@ public class SessionManager implements Listener {
         this.sessionDurationSeconds = cfg.getInt("session_duration_seconds", 1800);
         this.toolRandomisation      = cfg.getBoolean("tool_randomisation_enabled", true);
         this.toolCheckIntervalTicks = cfg.getInt("tool_check_interval_seconds", 30) * 20;
-        this.survivalEnabled        = cfg.getBoolean("survival_worlds", true);
+        this.survivalEnabled        = cfg.getBoolean("survival_worlds", false);
         this.voidEnabled            = cfg.getBoolean("void_worlds", true);
-        this.hermitcraftEnabled     = cfg.getBoolean("hermitcraft_worlds", false);
+        this.libraryEnabled         = cfg.getBoolean("library_worlds", true);
         this.baritoneControlEnabled = cfg.getBoolean("baritone_control_enabled", true);
         this.voidPalette = VoidScatterGenerator.forConfig(
             cfg.getString("void_scatter_palette", "scatter_classic"));
+        // Case-insensitive set of source maps to serve in ADVENTURE mode.
+        java.util.Set<String> adv = new java.util.TreeSet<>(String.CASE_INSENSITIVE_ORDER);
+        java.util.List<String> advList = cfg.getStringList("adventure_maps");
+        if (advList.isEmpty()) advList = java.util.Arrays.asList("hermitcraft2", "hermitcraft3");
+        adv.addAll(advList);
+        this.adventureMaps = adv;
+        // Sky-island maps (bridge across void). Substring match on source name.
+        java.util.List<String> brList = cfg.getStringList("bridge_maps");
+        if (brList.isEmpty()) brList = java.util.Arrays.asList("skywars", "bedwars");
+        java.util.List<String> br = new java.util.ArrayList<>();
+        for (String s : brList) br.add(s.toLowerCase());
+        this.bridgeMaps = br;
         this.worldType = switch (cfg.getString("world_type", "modern").toLowerCase()) {
             case "beta"        -> WorldType.BETA;
             case "2013", "legacy_2013" -> WorldType.LEGACY_2013;
@@ -97,100 +126,117 @@ public class SessionManager implements Listener {
     public void startWorldPool() {
         plugin.getServer().getMessenger().registerOutgoingPluginChannel(plugin, SESSION_CHANNEL);
         ensureDatapackInMainWorld();
-        if (hermitcraftEnabled) {
-            loadHermitSpawnPoints();
-            bgPool.submit(this::loadHermitcraftWorlds);
-        }
+        if (libraryEnabled) discoverLibrarySources();
         refillPool();
     }
 
-    private void loadHermitSpawnPoints() {
-        java.io.File spawnFile = new java.io.File("hermitcraft/spawn_points.json");
-        if (!spawnFile.exists()) {
-            plugin.getLogger().warning("Hermitcraft spawn_points.json not found at " + spawnFile.getAbsolutePath());
+    // ── Library source discovery ─────────────────────────────────────────────────
+
+    /**
+     * Scan map_library/ for converted worlds (a dir containing level.dat). For each,
+     * load its spawn_candidates.json if present. Worlds without spawn candidates are
+     * still usable — they fall back to the world's own spawn location on join.
+     */
+    private void discoverLibrarySources() {
+        File dir = new File(LIBRARY_DIR);
+        File[] entries = dir.listFiles(File::isDirectory);
+        if (entries == null || entries.length == 0) {
+            plugin.getLogger().warning("library_worlds enabled but no worlds found in " + dir.getAbsolutePath());
             return;
         }
-        try (java.io.FileReader r = new java.io.FileReader(spawnFile)) {
-            // Parse JSON manually (no Gson dependency — use Bukkit's bundled approach)
-            org.bukkit.configuration.file.YamlConfiguration dummy; // just for context
-            String json = new String(java.nio.file.Files.readAllBytes(spawnFile.toPath()));
-            // Simple parse: {"5": [[x,y,z],...], "6": [...], ...}
-            for (int s : HERMIT_SEASONS) {
-                java.util.List<double[]> pts = new java.util.ArrayList<>();
-                String marker = "\"" + s + "\":[";
-                int start = json.indexOf(marker);
-                if (start < 0) continue;
-                start += marker.length();
-                int depth = 1;
-                StringBuilder buf = new StringBuilder("[");
-                for (int i = start; i < json.length() && depth > 0; i++) {
-                    char c = json.charAt(i);
-                    if (c == '[') depth++;
-                    else if (c == ']') { depth--; if (depth == 0) break; }
-                    buf.append(c);
-                }
-                buf.append("]");
-                // Parse [[x,y,z],...] from buf
-                String list = buf.toString().replaceAll("\\s","");
-                for (String triple : list.substring(2, list.length()-2).split("\\],\\[")) {
-                    String[] parts = triple.split(",");
-                    if (parts.length == 3)
-                        pts.add(new double[]{Double.parseDouble(parts[0]),
-                                             Double.parseDouble(parts[1]),
-                                             Double.parseDouble(parts[2])});
-                }
-                hermitSpawnPoints.put(s, pts);
-                plugin.getLogger().info("Hermitcraft S" + s + ": " + pts.size() + " spawn points loaded");
-            }
-        } catch (Exception e) {
-            plugin.getLogger().severe("Failed to load hermitcraft spawn points: " + e.getMessage());
+        for (File w : entries) {
+            if (!new File(w, "level.dat").exists()) continue;
+            librarySources.add(w);
+            java.util.List<SpawnPoint> spawns = loadSpawnCandidates(w);
+            if (!spawns.isEmpty()) sourceSpawns.put(w.getName(), spawns);
+            plugin.getLogger().info("Library source: " + w.getName() + " (" + spawns.size() + " spawn candidates)");
         }
+        plugin.getLogger().info("Discovered " + librarySources.size() + " library worlds.");
     }
 
-    private void loadHermitcraftWorlds() {
-        java.io.File hermitBase = new java.io.File("hermitcraft");
-        for (int s : HERMIT_SEASONS) {
-            java.io.File worldDir = new java.io.File(hermitBase, "hermitcraft" + s);
-            if (!worldDir.exists()) {
-                plugin.getLogger().warning("Hermitcraft S" + s + " world not found at " + worldDir);
-                continue;
-            }
-            // Symlink the world into the server's world container so Paper can load it
-            // without copying 3+ GB. Remove session.lock first.
-            java.io.File dest = new java.io.File("hc" + s);
-            if (!dest.exists()) {
-                try {
-                    java.nio.file.Files.createSymbolicLink(dest.toPath(), worldDir.toPath().toAbsolutePath());
-                    plugin.getLogger().info("Symlinked hermitcraft S" + s + " → " + dest);
-                } catch (Exception e) {
-                    plugin.getLogger().severe("Failed to symlink hc" + s + ": " + e.getMessage());
-                    continue;
+    /**
+     * Parse spawn_candidates.json:
+     *   {"spawns": [[x,y,z], ...], "labels": ["xisuma"|"grid"|"manual", ...]}
+     * labels[i] pairs with spawns[i]; a missing/short labels array defaults each to "grid".
+     * Returns an empty list if absent/bad.
+     */
+    private java.util.List<SpawnPoint> loadSpawnCandidates(File worldDir) {
+        java.util.List<SpawnPoint> out = new java.util.ArrayList<>();
+        File f = new File(worldDir, "spawn_candidates.json");
+        if (!f.exists()) return out;
+        try {
+            String raw = new String(java.nio.file.Files.readAllBytes(f.toPath()), StandardCharsets.UTF_8);
+
+            // Parse coordinate triples from the "spawns" array.
+            java.util.List<int[]> coords = new java.util.ArrayList<>();
+            String compact = raw.replaceAll("\\s", "");
+            int arr = compact.indexOf("\"spawns\":[");
+            if (arr < 0) return out;
+            int start = arr + "\"spawns\":[".length();
+            int end = compact.indexOf("]]", start);
+            if (end >= 0) {
+                String inner = compact.substring(start, end + 1); // [x,y,z],...,[x,y,z]
+                for (String triple : inner.split("\\],\\[")) {
+                    String[] parts = triple.replace("[", "").replace("]", "").split(",");
+                    if (parts.length == 3)
+                        coords.add(new int[]{(int) Math.floor(Double.parseDouble(parts[0])),
+                                             (int) Math.floor(Double.parseDouble(parts[1])),
+                                             (int) Math.floor(Double.parseDouble(parts[2]))});
                 }
             }
-            new java.io.File(dest, "session.lock").delete();
-            CompletableFuture<World> f = new CompletableFuture<>();
-            Bukkit.getScheduler().runTask(plugin, () -> {
-                try {
-                    World w = new WorldCreator("hc" + s)
-                        .environment(World.Environment.NORMAL)
-                        .generateStructures(false)
-                        .createWorld();
-                    if (w != null) {
-                        w.setGameRule(GameRule.DO_MOB_SPAWNING, false);
-                        w.setGameRule(GameRule.DO_DAYLIGHT_CYCLE, true);
-                        w.setGameRule(GameRule.ANNOUNCE_ADVANCEMENTS, false);
-                        w.setDifficulty(Difficulty.PEACEFUL);
-                        hermitWorlds.put(s, w);
-                        plugin.getLogger().info("Hermitcraft S" + s + " loaded (" + w.getName() + ")");
-                    }
-                    f.complete(w);
-                } catch (Exception e) {
-                    plugin.getLogger().severe("Failed to load hc" + s + ": " + e.getMessage());
-                    f.complete(null);
+
+            // Parse labels (optional) — strings in order.
+            java.util.List<String> labels = new java.util.ArrayList<>();
+            int lArr = raw.indexOf("\"labels\"");
+            if (lArr >= 0) {
+                int lStart = raw.indexOf('[', lArr);
+                int lEnd = (lStart >= 0) ? raw.indexOf(']', lStart) : -1;
+                if (lStart >= 0 && lEnd >= 0) {
+                    java.util.regex.Matcher m = java.util.regex.Pattern
+                        .compile("\"((?:\\\\.|[^\"\\\\])*)\"")
+                        .matcher(raw.substring(lStart, lEnd));
+                    while (m.find()) labels.add(m.group(1));
                 }
-            });
-            try { f.get(120, TimeUnit.SECONDS); } catch (Exception ignored) {}
+            }
+
+            for (int i = 0; i < coords.size(); i++) {
+                int[] c = coords.get(i);
+                String label = (i < labels.size()) ? labels.get(i) : "grid";
+                out.add(new SpawnPoint(c[0], c[1], c[2], label));
+            }
+        } catch (Exception e) {
+            plugin.getLogger().warning("Failed to parse spawn_candidates.json for " + worldDir.getName() + ": " + e.getMessage());
         }
+        return out;
+    }
+
+    /** Serialize a spawn list back to the {"spawns":[...],"labels":[...]} format. */
+    private String serializeSpawns(java.util.List<SpawnPoint> spawns) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("{\"spawns\": [");
+        for (int i = 0; i < spawns.size(); i++) {
+            SpawnPoint p = spawns.get(i);
+            if (i > 0) sb.append(", ");
+            sb.append("[").append(p.x).append(", ").append(p.y).append(", ").append(p.z).append("]");
+        }
+        sb.append("], \"labels\": [");
+        for (int i = 0; i < spawns.size(); i++) {
+            if (i > 0) sb.append(", ");
+            sb.append("\"").append(spawns.get(i).label.replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
+        }
+        sb.append("]}");
+        return sb.toString();
+    }
+
+    /**
+     * Write the given spawn list to map_library/&lt;source&gt;/spawn_candidates.json.
+     * Synchronizes on the list so concurrent join-path reads see a consistent snapshot.
+     */
+    void saveSpawnCandidates(String source, java.util.List<SpawnPoint> spawns) throws IOException {
+        File f = new File(LIBRARY_DIR + File.separator + source, "spawn_candidates.json");
+        String json;
+        synchronized (spawns) { json = serializeSpawns(spawns); }
+        java.nio.file.Files.write(f.toPath(), json.getBytes(StandardCharsets.UTF_8));
     }
 
     private void copyDir(java.io.File src, java.io.File dst) throws java.io.IOException {
@@ -264,7 +310,81 @@ public class SessionManager implements Listener {
                     }
                 }
             }
+            if (libraryEnabled && !librarySources.isEmpty()) {
+                while (libraryPool.size() < poolSize) {
+                    World w = copyLibraryWorld();
+                    if (w != null) {
+                        libraryPool.add(w);
+                        plugin.getLogger().info("World pool: library world ready (" + w.getName() + "), pool size=" + libraryPool.size());
+                    } else {
+                        break; // copy failed — avoid a tight retry loop
+                    }
+                }
+            }
         });
+    }
+
+    /**
+     * Copy a random source world from map_library/ into a fresh bs_lib_* world dir,
+     * load it with a void generator (out-of-bounds chunks → void, never new terrain),
+     * and remember its spawn candidates. Runs on the bgPool thread; the createWorld
+     * call is dispatched to the main thread. Returns the loaded copy, or null on error.
+     */
+    private World copyLibraryWorld() {
+        return copyLibraryWorld(librarySources.get(rng.nextInt(librarySources.size())));
+    }
+
+    /**
+     * Copy a SPECIFIC source world from map_library/ into a fresh bs_lib_* world dir.
+     * Same logic as the random variant but for a caller-chosen source (used by /visit).
+     */
+    private World copyLibraryWorld(File source) {
+        String name = "bs_lib_" + worldCounter.incrementAndGet() + "_" + Long.toHexString(rng.nextLong() & 0xFFFFFFL);
+        File dest = new File(name);
+        try {
+            copyDir(source, dest);
+            new File(dest, "session.lock").delete();
+            new File(dest, "uid.dat").delete(); // stale world UID from the source copy
+        } catch (Exception e) {
+            plugin.getLogger().severe("Library copy failed (" + source.getName() + " → " + name + "): " + e.getMessage());
+            deleteDir(dest);
+            return null;
+        }
+
+        CompletableFuture<World> future = new CompletableFuture<>();
+        Bukkit.getScheduler().runTask(plugin, () -> {
+            try {
+                World w = new WorldCreator(name)
+                    .environment(World.Environment.NORMAL)
+                    .generator(new VoidGenerator())
+                    .generateStructures(false)
+                    .createWorld();
+                if (w != null) {
+                    w.setDifficulty(Difficulty.PEACEFUL);
+                    w.setGameRule(GameRule.DO_MOB_SPAWNING, false);
+                    w.setGameRule(GameRule.DO_DAYLIGHT_CYCLE, true);
+                    w.setGameRule(GameRule.ANNOUNCE_ADVANCEMENTS, false);
+                    w.setGameRule(GameRule.SHOW_DEATH_MESSAGES, false);
+                    w.setGameRule(GameRule.DO_IMMEDIATE_RESPAWN, true);
+                    w.setTime(6000);
+                    java.util.List<SpawnPoint> spawns = sourceSpawns.get(source.getName());
+                    if (spawns != null && !spawns.isEmpty()) librarySpawns.put(name, spawns);
+                    librarySource.put(name, source.getName());
+                }
+                future.complete(w);
+            } catch (Exception e) {
+                plugin.getLogger().severe("Library world load failed (" + name + "): " + e.getMessage());
+                future.complete(null);
+            }
+        });
+        try {
+            World w = future.get(120, TimeUnit.SECONDS);
+            if (w == null) { deleteDir(dest); return null; }
+            return w;
+        } catch (Exception e) {
+            plugin.getLogger().warning("Library world load timed out (" + name + "): " + e.getMessage());
+            return null;
+        }
     }
 
     private World generateWorld() {
@@ -387,29 +507,49 @@ public class SessionManager implements Listener {
      */
     @EventHandler
     public void onWorldInit(WorldInitEvent event) {
-        // For custom-generator worlds (void, legacy terrain), lock spawn at (0,64,0)
-        // so Paper skips its expensive surface-scan — the generator handles spawn itself.
-        // For MODERN vanilla worlds, let Paper find a proper non-ocean spawn naturally.
-        if (event.getWorld().getName().startsWith("bs_") && worldType != WorldType.MODERN) {
+        // For custom-generator worlds (void, library copies, legacy terrain), lock spawn
+        // at (0,64,0) so Paper skips its expensive surface-scan — the generator handles
+        // spawn itself and players are teleported to a chosen point on join anyway.
+        // For MODERN vanilla survival worlds, let Paper find a proper non-ocean spawn.
+        String name = event.getWorld().getName();
+        if (name.startsWith("bs_lib_") || (name.startsWith("bs_") && worldType != WorldType.MODERN)) {
             event.getWorld().setSpawnLocation(0, 64, 0);
         }
     }
 
-    /** In void scatter worlds, cancel void damage and teleport back to spawn instead. */
+    /**
+     * Keep the bot alive in any session world. A death would respawn the player in the
+     * main 1.19 world (the bug the tester hit). Cancel VOID and FALL damage outright;
+     * on a void fall, teleport back to a valid spawn. Peaceful already covers mobs/hunger.
+     */
     @EventHandler
-    public void onVoidFall(EntityDamageEvent event) {
-        if (event.getCause() != EntityDamageEvent.DamageCause.VOID) return;
+    public void onSessionDamage(EntityDamageEvent event) {
         if (!(event.getEntity() instanceof Player player)) return;
         if (!player.getWorld().getName().startsWith("bs_")) return;
-        if (!voidEnabled) return;
-        event.setCancelled(true);
-        player.setFallDistance(0f);
-        if (!plugin.isEnabled()) return; // server shutting down — skip scheduling
-        // Defer one tick — teleporting inside a damage event corrupts physics state and freezes the player
-        Bukkit.getScheduler().runTask(plugin, () -> {
-            player.setVelocity(new org.bukkit.util.Vector(0, 0, 0));
-            player.teleport(player.getWorld().getSpawnLocation());
-        });
+        EntityDamageEvent.DamageCause cause = event.getCause();
+        boolean isVoidWorld = player.getWorld().getName().startsWith("bs_lib_") || voidEnabled;
+        if (cause == EntityDamageEvent.DamageCause.VOID && isVoidWorld) {
+            event.setCancelled(true);
+            player.setFallDistance(0f);
+            if (!plugin.isEnabled()) return;
+            boolean isLibrary = player.getWorld().getName().startsWith("bs_lib_");
+            // Defer one tick — teleporting inside a damage event freezes the player.
+            Bukkit.getScheduler().runTask(plugin, () -> {
+                player.setVelocity(new org.bukkit.util.Vector(0, 0, 0));
+                player.teleport(pickSpawn(player.getWorld(), isLibrary));
+            });
+        } else if (cause == EntityDamageEvent.DamageCause.FALL) {
+            event.setCancelled(true);
+            player.setFallDistance(0f);
+        }
+    }
+
+    /** Safety net: if the bot somehow dies, respawn it in the SAME session world, never the 1.19 hub. */
+    @EventHandler
+    public void onPlayerRespawn(org.bukkit.event.player.PlayerRespawnEvent event) {
+        World w = playerWorlds.get(event.getPlayer().getUniqueId());
+        if (w == null) return;
+        event.setRespawnLocation(pickSpawn(w, w.getName().startsWith("bs_lib_")));
     }
 
     @EventHandler
@@ -417,55 +557,34 @@ public class SessionManager implements Listener {
         Player player = event.getPlayer();
         event.joinMessage(null);
 
-        String modeStr = assignMode();
-        boolean isVoid        = "void".equals(modeStr);
-        boolean isHermitcraft = "hermitcraft".equals(modeStr);
+        String category = assignMode(); // "void" | "survival" | "library"
 
-        // Hermitcraft: pick a random loaded season and spawn point — no pool needed
-        if (isHermitcraft) {
-            java.util.List<Integer> loaded = new java.util.ArrayList<>(hermitWorlds.keySet());
-            if (loaded.isEmpty()) {
-                plugin.getLogger().warning("No hermitcraft worlds loaded — falling back to survival");
-                modeStr = "survival";
-                isHermitcraft = false;
-            } else {
-                int season = loaded.get(rng.nextInt(loaded.size()));
-                World hWorld = hermitWorlds.get(season);
-                java.util.List<double[]> pts = hermitSpawnPoints.getOrDefault(season, java.util.List.of());
-                double[] pt = pts.isEmpty()
-                    ? new double[]{hWorld.getSpawnLocation().getX(), 64, hWorld.getSpawnLocation().getZ()}
-                    : pts.get(rng.nextInt(pts.size()));
-
-                playerWorlds.put(player.getUniqueId(), hWorld);
-                World finalWorld = hWorld;
-                String finalMode = "hermitcraft_s" + season;
-
-                Bukkit.getScheduler().runTask(plugin, () -> {
-                    player.getInventory().clear();
-                    player.setGameMode(GameMode.SURVIVAL);
-                    Location spawnLoc = new Location(finalWorld, pt[0], pt[1], pt[2]);
-                    player.teleport(spawnLoc);
-                    if (toolRandomisation) { giveRandomTools(player); scheduleToolCheck(player); }
-                    plugin.getLogger().info("Session: " + player.getName() + " → " + finalWorld.getName() + " [" + finalMode + "] @ " + (int)pt[0] + "," + (int)pt[1] + "," + (int)pt[2]);
-                    Bukkit.getScheduler().runTaskLater(plugin, () -> {
-                        if (player.isOnline()) sendSessionStart(player, finalMode);
-                    }, 40L);
-                });
-
-                int timerId = Bukkit.getScheduler().scheduleSyncDelayedTask(plugin,
-                    () -> { if (player.isOnline()) endSession(player, "timeout"); },
-                    (long) sessionDurationSeconds * 20L);
-                sessionTimers.put(player.getUniqueId(), timerId);
-                return;
+        // Resolve a world for the chosen category. Library worlds come only from the
+        // pre-staged pool (the copy is too large to do synchronously at join); if the
+        // library pool is momentarily empty, fall back to a fast-to-generate void world.
+        World world;
+        if ("library".equals(category)) {
+            world = libraryPool.poll();
+            if (world == null) {
+                plugin.getLogger().warning("Library pool empty — falling back to void for " + player.getName());
+                category = "void";
+                world = voidPool.poll();
+                if (world == null) world = generateVoidWorldSync();
+            }
+        } else if ("void".equals(category)) {
+            world = voidPool.poll();
+            if (world == null) {
+                plugin.getLogger().warning("Void pool empty — generating on-demand for " + player.getName());
+                world = generateVoidWorldSync();
+            }
+        } else {
+            world = survivalPool.poll();
+            if (world == null) {
+                plugin.getLogger().warning("Survival pool empty — generating on-demand for " + player.getName());
+                world = generateSurvivalWorldSync();
             }
         }
 
-        Queue<World> pool = isVoid ? voidPool : survivalPool;
-        World world = pool.poll();
-        if (world == null) {
-            plugin.getLogger().warning("World pool empty — generating on-demand for " + player.getName());
-            world = isVoid ? generateVoidWorldSync() : generateSurvivalWorldSync();
-        }
         if (world == null) {
             player.kick(net.kyori.adventure.text.Component.text("§cFailed to create session world. Try again in a moment."));
             refillPool();
@@ -475,28 +594,55 @@ public class SessionManager implements Listener {
         playerWorlds.put(player.getUniqueId(), world);
         refillPool();
 
-        World finalWorld = world;
-        String finalMode = modeStr; // capture before lambda (modeStr may have been reassigned)
+        final World finalWorld = world;
+        final String finalCategory = category;
+        final boolean isVoid    = "void".equals(category);
+        final boolean isLibrary = "library".equals(category);
+
+        // Library worlds are throwaway copies. Most run in SURVIVAL (the bot may break
+        // blocks to free itself — the source map is never touched). The most valuable
+        // maps, listed in adventure_maps, run in ADVENTURE so the bot can't damage them.
+        final String source = isLibrary ? librarySource.getOrDefault(finalWorld.getName(), "?") : null;
+        final boolean isAdventureLibrary = isLibrary && source != null && adventureMaps.contains(source);
+        // Sky-island library maps (skywars/bedwars): the bot bridges across void.
+        final boolean isBridgeLibrary = isLibrary && !isAdventureLibrary && isBridgeSource(source);
+        // Client bot mode string: bridge maps use "bridge", other library "adventure".
+        final String clientMode = isLibrary ? (isBridgeLibrary ? "bridge" : "adventure")
+                                            : clientModeFor(finalCategory);
 
         Bukkit.getScheduler().runTask(plugin, () -> {
             player.getInventory().clear();
-            player.setGameMode(GameMode.SURVIVAL);
-            player.teleport(finalWorld.getSpawnLocation());
+            player.setGameMode(isAdventureLibrary ? GameMode.ADVENTURE : GameMode.SURVIVAL);
+
+            SpawnPoint chosen = isLibrary ? pickSpawnPoint(finalWorld) : null;
+            Location spawn = (chosen != null) ? toLocation(finalWorld, chosen)
+                                              : finalWorld.getSpawnLocation();
+            player.teleport(spawn);
 
             if (isVoid) {
                 giveScatterInventory(player);
-            } else if (toolRandomisation) {
+            } else if (toolRandomisation && !isAdventureLibrary) {
+                // Survival + survival-library get tools (so the bot can break obstacles).
+                // Adventure-library maps skip tools — the player can't break anyway.
                 giveRandomTools(player);
                 scheduleToolCheck(player);
             }
+            // Bridge maps also get cobblestone so Baritone can bridge across void.
+            if (isBridgeLibrary) giveBridgeBlocks(player);
 
-            plugin.getLogger().info("Session: " + player.getName() +
-                " → " + finalWorld.getName() + " [" + finalMode + "]");
+            String label = isLibrary ? ("library:" + source) : finalCategory;
+            String spawnDesc = (chosen != null)
+                ? " spawn '" + chosen.label + "' @ " + spawn.getBlockX() + "," + spawn.getBlockY() + "," + spawn.getBlockZ()
+                : " @ " + spawn.getBlockX() + "," + spawn.getBlockY() + "," + spawn.getBlockZ();
+            String summary = "World: " + finalWorld.getName() + " [" + label + "] mode=" + clientMode + spawnDesc;
+            plugin.getLogger().info("Session: " + player.getName() + " → " + summary);
+            // In-game diagnostic so the tester can see exactly what they're in.
+            player.sendMessage(net.kyori.adventure.text.Component.text("§e[Blockscope] " + summary));
 
             Bukkit.getScheduler().runTaskLater(plugin, () -> {
                 if (player.isOnline()) {
-                    sendSessionStart(player, finalMode);
-                    plugin.getLogger().info("Sent session_start → " + player.getName() + " [" + finalMode + "]");
+                    sendSessionStart(player, clientMode);
+                    plugin.getLogger().info("Sent session_start → " + player.getName() + " [" + clientMode + "]");
                 }
             }, 40L);
         });
@@ -510,6 +656,167 @@ public class SessionManager implements Listener {
             },
             (long) sessionDurationSeconds * 20L);
         sessionTimers.put(player.getUniqueId(), timerId);
+    }
+
+    /** Pick the spawn location: a random library candidate, else the world's own spawn. */
+    private Location pickSpawn(World world, boolean isLibrary) {
+        if (isLibrary) {
+            SpawnPoint p = pickSpawnPoint(world);
+            if (p != null) return toLocation(world, p);
+        }
+        return world.getSpawnLocation();
+    }
+
+    /** Pick a random SpawnPoint for a library world, or null if none are configured. */
+    private SpawnPoint pickSpawnPoint(World world) {
+        java.util.List<SpawnPoint> spawns = librarySpawns.get(world.getName());
+        if (spawns == null || spawns.isEmpty()) return null;
+        synchronized (spawns) {
+            if (spawns.isEmpty()) return null;
+            return spawns.get(rng.nextInt(spawns.size()));
+        }
+    }
+
+    /** Convert a SpawnPoint to a Location with x/z centered on the block. */
+    static Location toLocation(World world, SpawnPoint p) {
+        return new Location(world, p.x + 0.5, p.y, p.z + 0.5);
+    }
+
+    // ── Accessors for the /maps and /visit commands ─────────────────────────────
+
+    /**
+     * Alphabetically-sorted (source name, spawn-candidate count) pairs for every
+     * discovered library source. Count is 0 if the source has no spawn_candidates.json.
+     */
+    java.util.List<Map.Entry<String, Integer>> listLibrarySources() {
+        java.util.List<Map.Entry<String, Integer>> out = new java.util.ArrayList<>();
+        for (File f : librarySources) {
+            java.util.List<SpawnPoint> spawns = sourceSpawns.get(f.getName());
+            out.add(new java.util.AbstractMap.SimpleEntry<>(f.getName(), spawns == null ? 0 : spawns.size()));
+        }
+        out.sort(Map.Entry.comparingByKey(String.CASE_INSENSITIVE_ORDER));
+        return out;
+    }
+
+    /** Discovered library source world names, in discovery order (for tab-completion). */
+    java.util.List<String> librarySourceNames() {
+        java.util.List<String> out = new java.util.ArrayList<>();
+        for (File f : librarySources) out.add(f.getName());
+        return out;
+    }
+
+    /**
+     * Resolve a user-typed source name to a discovered source File. Tries exact
+     * (case-insensitive) match first, then a unique case-insensitive prefix match.
+     * Returns null if not found or ambiguous.
+     */
+    File resolveSource(String query) {
+        if (query == null || query.isEmpty()) return null;
+        for (File f : librarySources) {
+            if (f.getName().equalsIgnoreCase(query)) return f;
+        }
+        File prefixMatch = null;
+        for (File f : librarySources) {
+            if (f.getName().toLowerCase().startsWith(query.toLowerCase())) {
+                if (prefixMatch != null) return null; // ambiguous
+                prefixMatch = f;
+            }
+        }
+        return prefixMatch;
+    }
+
+    /**
+     * Serve an op a FRESH COPY of a specific source map for manual inspection/curation.
+     * Copy + world load run async on the bgPool (never blocks the main thread); when the
+     * world is ready, the player is registered like a session (playerWorlds + CREATIVE +
+     * teleport to a spawn) but WITHOUT a bot session_start or a session timer — the visit
+     * persists until the op disconnects or runs /visit again. Any previous visit/session
+     * world the op is in is torn down first.
+     */
+    void visitSource(Player player, File source) {
+        // Tear down whatever session/visit world the op is currently in.
+        if (playerWorlds.get(player.getUniqueId()) != null) {
+            endSession(player, "visit-switch");
+        }
+        final UUID uuid = player.getUniqueId();
+        final String sourceName = source.getName();
+        bgPool.submit(() -> {
+            World w = copyLibraryWorld(source);
+            Bukkit.getScheduler().runTask(plugin, () -> {
+                if (!player.isOnline()) {
+                    // Op left before the copy finished — don't leak the world.
+                    if (w != null) unloadAndDeleteWorld(w);
+                    return;
+                }
+                if (w == null) {
+                    player.sendMessage(net.kyori.adventure.text.Component.text(
+                        "§cFailed to copy source '" + sourceName + "' — see server log."));
+                    return;
+                }
+                playerWorlds.put(uuid, w);
+                player.setGameMode(GameMode.CREATIVE);
+                player.setAllowFlight(true);
+                player.setFlying(true);
+                Location spawn = pickSpawn(w, true);
+                player.teleport(spawn);
+                String summary = "World: " + w.getName() + " [visit:" + sourceName + "] mode=creative @ "
+                    + spawn.getBlockX() + "," + spawn.getBlockY() + "," + spawn.getBlockZ();
+                plugin.getLogger().info("Visit: " + player.getName() + " → " + summary);
+                player.sendMessage(net.kyori.adventure.text.Component.text("§e[Blockscope] " + summary));
+                player.sendMessage(net.kyori.adventure.text.Component.text(
+                    "§7Curate with /spawn add|del|save. Run /visit again or disconnect to clean up."));
+            });
+        });
+    }
+
+    // ── Accessors for the /spawn command ────────────────────────────────────────
+
+    /** The source world name a live copy was made from, or null if not a library copy. */
+    String getLibrarySource(String copyWorldName) { return librarySource.get(copyWorldName); }
+
+    /** The live spawn list for a copy world (shared with its source), or null. */
+    java.util.List<SpawnPoint> getSpawnsForWorld(String copyWorldName) {
+        return librarySpawns.get(copyWorldName);
+    }
+
+    /**
+     * Reload a source's spawn list from disk and re-point all in-memory references
+     * (the source entry and every live copy made from it) at the fresh list, so the
+     * current session sees the reloaded data. Returns the new list size.
+     */
+    int reloadSpawnsForSource(String source) {
+        File srcDir = new File(LIBRARY_DIR + File.separator + source);
+        java.util.List<SpawnPoint> fresh = loadSpawnCandidates(srcDir);
+        // Use a synchronizable, mutable list so future add/del still work in place.
+        java.util.List<SpawnPoint> live = java.util.Collections.synchronizedList(
+            new java.util.ArrayList<>(fresh));
+        sourceSpawns.put(source, live);
+        for (java.util.Map.Entry<String, String> e : librarySource.entrySet()) {
+            if (source.equals(e.getValue())) librarySpawns.put(e.getKey(), live);
+        }
+        return live.size();
+    }
+
+    /** Map an internal world category to the client-side BotModule mode string. */
+    private String clientModeFor(String category) {
+        return switch (category) {
+            case "void"    -> "void_scatter";
+            case "library" -> "adventure";
+            default        -> "survival";
+        };
+    }
+
+    /** True if the source map is a sky-island map (substring match against bridge_maps). */
+    private boolean isBridgeSource(String source) {
+        if (source == null) return false;
+        String s = source.toLowerCase();
+        for (String b : bridgeMaps) if (s.contains(b)) return true;
+        return false;
+    }
+
+    /** Cobblestone for sky-island bridging (Baritone uses it as throwaway scaffolding). */
+    private void giveBridgeBlocks(Player player) {
+        for (int i = 0; i < 5; i++) player.getInventory().addItem(new ItemStack(Material.COBBLESTONE, 64));
     }
 
     @EventHandler
@@ -535,14 +842,10 @@ public class SessionManager implements Listener {
             player.kick(net.kyori.adventure.text.Component.text("§aSession complete — reconnecting…"));
         }
 
-        // Hermitcraft worlds are permanent — never unload or delete them.
-        if (hermitWorlds.containsValue(world)) {
-            World fallback = Bukkit.getWorlds().stream()
-                .filter(w -> !w.getName().startsWith("bs_") && !w.getName().startsWith("hc"))
-                .findFirst().orElse(Bukkit.getWorlds().get(0));
-            world.getPlayers().forEach(p -> p.teleport(fallback.getSpawnLocation()));
-            return;
-        }
+        // All session worlds — including library copies — are throwaway and deleted.
+        // The library source under map_library/ is never touched (only its copy is).
+        librarySpawns.remove(world.getName());
+        librarySource.remove(world.getName());
         Bukkit.getScheduler().runTaskLater(plugin, () -> unloadAndDeleteWorld(world), 5L);
     }
 
@@ -606,10 +909,10 @@ public class SessionManager implements Listener {
 
     private String assignMode() {
         java.util.List<String> modes = new java.util.ArrayList<>();
-        if (survivalEnabled)    modes.add("survival");
-        if (voidEnabled)        modes.add("void");
-        if (hermitcraftEnabled) modes.add("hermitcraft");
-        if (modes.isEmpty()) return "survival";
+        if (survivalEnabled) modes.add("survival");
+        if (voidEnabled)     modes.add("void");
+        if (libraryEnabled && !librarySources.isEmpty()) modes.add("library");
+        if (modes.isEmpty()) return "void";
         return modes.get((modeIndex++) % modes.size());
     }
 
@@ -765,7 +1068,9 @@ public class SessionManager implements Listener {
         bgPool.shutdownNow();
         for (World w : survivalPool) unloadAndDeleteWorld(w);
         for (World w : voidPool)     unloadAndDeleteWorld(w);
+        for (World w : libraryPool)  unloadAndDeleteWorld(w);
         survivalPool.clear();
         voidPool.clear();
+        libraryPool.clear();
     }
 }

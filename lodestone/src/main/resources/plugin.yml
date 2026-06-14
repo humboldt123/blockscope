@@ -7,7 +7,31 @@ authors: [blockscope]
 
 softdepend: []
 
-commands: {}
+commands:
+  spawn:
+    description: Curate library-world spawn points (op only).
+    usage: /spawn <list|go <n>|next|prev|random|add|del [n]|save|reload>
+    permission: blockscope.spawn
+  spoofspawn:
+    description: Teleport to a random library spawn point (op only).
+    usage: /spoofspawn
+    permission: blockscope.spawn
+  maps:
+    description: List discovered library source maps + spawn counts (op only).
+    usage: /maps
+    permission: blockscope.maps
+  visit:
+    description: Serve a fresh copy of a specific library source map and teleport in (op only).
+    usage: /visit <source>
+    permission: blockscope.maps
+
+permissions:
+  blockscope.spawn:
+    description: Allows curating library-world spawn points.
+    default: op
+  blockscope.maps:
+    description: Allows listing and visiting library source maps.
+    default: op
 
 # Outgoing plugin message channels
 channels:

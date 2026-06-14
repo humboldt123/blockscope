@@ -1,7 +1,31 @@
 baritone_control_enabled: true
-survival_sessions_enabled: true
-void_scatter_sessions_enabled: true
-session_duration_seconds: 1800
 tool_randomisation_enabled: true
 tool_check_interval_seconds: 30
-pool_size: 1          # low-RAM default — bump to 3 on the Linux box
+session_duration_seconds: 600
+
+# Which world categories to serve (round-robined across all enabled)
+survival_worlds: false      # 1.19 generated terrain — leaks modern blocks even with datapack; off by default
+void_worlds: true           # void scatter — clean controlled 1.8.9-era palette
+library_worlds: true        # pre-built converted maps (build maps + hermitcraft) from map_library/, copy-on-join
+
+# SOURCE library maps served in ADVENTURE gamemode (bot can't break — preserves the
+# most valuable maps). Every other library map runs in SURVIVAL (bot can break obstacles).
+adventure_maps:
+  - hermitcraft2
+  - hermitcraft3
+
+# Sky-island maps (substring match on source name): the bot bridges across the void
+# between islands (gets cobblestone + allowPlace). Default covers all skywars/bedwars.
+bridge_maps:
+  - skywars
+  - bedwars
+
+# Terrain type for GENERATED worlds (survival/void): modern | beta | 2013
+world_type: modern
+
+# Void scatter block palette: scatter_classic | classic_152 | all_1_19
+# classic_152 = only blocks that existed in MC 1.5.2 (old-block-only data); avoid all_1_19 (modern blocks).
+void_scatter_palette: classic_152
+
+# Pre-staged copies per category (VPS is 8 vCPU/16GB; library copies can be ~1.3GB each)
+pool_size: 2
