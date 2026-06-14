@@ -25,6 +25,11 @@ public class BlockscopeClient implements ClientModInitializer {
     private static boolean autoJumpDisabled = false;
     private static ReplayModIntegration replayModIntegration;
     private static boolean baritonePresent = false;
+    // Headless auto-connect: fire ConnectScreen.connect() once the title screen
+    // appears. Guarded so we only initiate one connect attempt; the mod's existing
+    // auto-reconnect (SessionProtocol.onDisconnect) handles every subsequent rejoin.
+    private static boolean autoConnectAttempted = false;
+    private static int autoConnectIdleTicks = 0;
 
     @Override
     public void onInitializeClient() {
@@ -111,6 +116,8 @@ public class BlockscopeClient implements ClientModInitializer {
         }
 
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
+            maybeAutoConnect(client);
+
             if (!autoJumpDisabled && client.options != null) {
                 if (client.options.getAutoJump().getValue()) {
                     client.options.getAutoJump().setValue(false);
@@ -144,5 +151,58 @@ public class BlockscopeClient implements ClientModInitializer {
         });
 
         System.out.println("[Blockscope] Initialized successfully");
+    }
+
+    /**
+     * Headless initial auto-connect. 1.19.4 has no --quickPlayMultiplayer launch
+     * flag, so we connect from inside the mod: once the TitleScreen is showing and
+     * we have no active connection, read the target from config/env and call
+     * ConnectScreen.connect(...). Runs at most once; the existing auto-reconnect
+     * path takes over for all later rejoins after session-end kicks.
+     */
+    private static void maybeAutoConnect(net.minecraft.client.MinecraftClient client) {
+        if (autoConnectAttempted) return;
+
+        com.blockscope.util.Config cfg = com.blockscope.util.Config.getInstance();
+        String host = cfg.autoconnectHost;
+        if (host == null || host.isBlank()) {
+            autoConnectAttempted = true; // disabled; never check again
+            return;
+        }
+
+        // Require a clean, disconnected state (no world, no live connection).
+        if (client.world != null || client.getNetworkHandler() != null) {
+            autoConnectIdleTicks = 0;
+            return;
+        }
+        // Wait until a menu screen is actually showing, then give it a few ticks to
+        // settle. We don't gate on TitleScreen specifically: with offline/invalid
+        // auth the first menu can be a warning/realms-notice screen, and matching
+        // the exact class is brittle across screen wrappers. Any non-null menu with
+        // no world is a safe place to initiate the connect.
+        if (client.currentScreen == null) {
+            autoConnectIdleTicks = 0;
+            return;
+        }
+        if (++autoConnectIdleTicks < 40) { // ~2s at 20 tps
+            if (autoConnectIdleTicks == 1) {
+                System.out.println("[Blockscope] Menu screen up ("
+                    + client.currentScreen.getClass().getName() + ") — auto-connecting shortly");
+            }
+            return;
+        }
+
+        autoConnectAttempted = true;
+        String address = host + ":" + cfg.autoconnectPort;
+        System.out.println("[Blockscope] Auto-connecting to " + address);
+        try {
+            net.minecraft.client.network.ServerInfo server =
+                new net.minecraft.client.network.ServerInfo("blockscope-autoconnect", address, false);
+            net.minecraft.client.gui.screen.ConnectScreen.connect(
+                client.currentScreen, client,
+                net.minecraft.client.network.ServerAddress.parse(address), server);
+        } catch (Exception e) {
+            System.err.println("[Blockscope] Auto-connect failed: " + e.getMessage());
+        }
     }
 }

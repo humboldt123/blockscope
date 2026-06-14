@@ -27,6 +27,14 @@ public class Config {
     public boolean autoReconnect = true;
     public int reconnectDelaySeconds = 3;
 
+    // Headless auto-connect on startup: when set, the client connects to this
+    // server as soon as the title screen appears (no human needed). Used by the
+    // headless Docker data-collection container. Empty host disables it.
+    // Env vars BLOCKSCOPE_AUTOCONNECT_HOST / BLOCKSCOPE_AUTOCONNECT_PORT override
+    // the properties values when present.
+    public String autoconnectHost = "";
+    public int autoconnectPort = 25565;
+
     // Phase 4: Entity capture settings
     public boolean captureNearbyEntities = true;
     public int entityCaptureRadius = 16;          // blocks (reduced from 32 for performance)
@@ -74,6 +82,17 @@ public class Config {
             ffmpegPath = props.getProperty("ffmpeg_path", "ffmpeg");
             autoReconnect = Boolean.parseBoolean(props.getProperty("auto_reconnect", "true"));
             reconnectDelaySeconds = Integer.parseInt(props.getProperty("reconnect_delay_seconds", "3"));
+
+            // Headless auto-connect (env vars take precedence over properties)
+            autoconnectHost = props.getProperty("autoconnect_host", "");
+            autoconnectPort = Integer.parseInt(props.getProperty("autoconnect_port", "25565"));
+            String envHost = System.getenv("BLOCKSCOPE_AUTOCONNECT_HOST");
+            String envPort = System.getenv("BLOCKSCOPE_AUTOCONNECT_PORT");
+            if (envHost != null && !envHost.isBlank()) autoconnectHost = envHost.trim();
+            if (envPort != null && !envPort.isBlank()) {
+                try { autoconnectPort = Integer.parseInt(envPort.trim()); }
+                catch (NumberFormatException ignored) {}
+            }
 
             // Phase 4: Entity capture
             captureNearbyEntities = Boolean.parseBoolean(props.getProperty("capture_nearby_entities", "true"));
