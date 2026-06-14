@@ -562,17 +562,16 @@ public class BotModule {
         Thread.sleep(3000);
         MinecraftClient.getInstance().execute(() -> {
             var s = BaritoneAPI.getSettings();
-            s.allowBreak.value         = true;
-            s.allowPlace.value         = true;
+            // Void worlds bake a connected branching walkway — the bot just follows it.
+            // allowPlace MUST be false or Baritone bridges out into the void to reach
+            // explore goals and walks off the path. allowBreak off too, so it can't dig
+            // through the walkway floor under itself. With neither, Baritone can only
+            // path on the existing walkway and physically cannot step into the void.
+            s.allowBreak.value         = false;
+            s.allowPlace.value         = false;
             s.allowParkour.value       = false;
             s.allowParkourPlace.value  = false;
             s.allowParkourAscend.value = false;
-            java.util.List<net.minecraft.item.Item> throwaway = new java.util.ArrayList<>();
-            for (Block b : VOID_SCATTER_BLOCKS) {
-                net.minecraft.item.Item item = b.asItem();
-                if (item != Items.AIR) throwaway.add(item);
-            }
-            s.acceptableThrowawayItems.value = throwaway;
         });
 
         // The new world has a connected path; just explore it.
