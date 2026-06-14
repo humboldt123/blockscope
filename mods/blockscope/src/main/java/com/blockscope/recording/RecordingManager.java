@@ -660,6 +660,8 @@ public class RecordingManager {
         try {
             java.net.HttpURLConnection conn = (java.net.HttpURLConnection)
                     new java.net.URL(config.serverUrl + path).openConnection();
+            conn.setConnectTimeout(2000);
+            conn.setReadTimeout(5000);
             conn.setRequestMethod("POST");
             if (body != null) {
                 conn.setDoOutput(true);

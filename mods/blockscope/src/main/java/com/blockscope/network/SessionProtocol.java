@@ -35,10 +35,27 @@ public class SessionProtocol {
     // Used by BlockscopeClient's DISCONNECT handler to decide whether to reconnect.
     private static volatile boolean inManagedSession = false;
     private static volatile ServerInfo lastServer = null;
+    // Captured by ClientPlayNetworkHandlerMixin before the DISCONNECT event fires.
+    private static volatile net.minecraft.text.Text lastDisconnectReason = null;
 
     public static boolean isInManagedSession() { return inManagedSession; }
     public static ServerInfo getLastServer()    { return lastServer; }
     public static void clearSession()          { inManagedSession = false; }
+
+    /** Called from the network-handler mixin so onDisconnect can tell a user quit from a kick. */
+    public static void setLastDisconnectReason(net.minecraft.text.Text reason) {
+        lastDisconnectReason = reason;
+    }
+
+    /** True if the player chose to leave (quit to title) rather than being kicked / timing out. */
+    private static boolean isManualQuit(net.minecraft.text.Text reason) {
+        if (reason == null) return false;
+        if (reason.getContent() instanceof net.minecraft.text.TranslatableTextContent tc) {
+            // Vanilla uses "disconnect.quitting" for the Disconnect / Save-and-Quit buttons.
+            return "disconnect.quitting".equals(tc.getKey());
+        }
+        return false;
+    }
 
     public static void registerClient(ReplayModIntegration replay) {
         replayMod = replay;
@@ -60,9 +77,14 @@ public class SessionProtocol {
 
                 if (baritonePresent) {
                     BotModule bot = BotModule.getInstance();
+                    // "bridge" = sky-island explore (walk + bridge across void); reuses the
+                    // ADVENTURE_EXPLORE behavior with the bridging flag on.
+                    boolean isBridge = "bridge".equalsIgnoreCase(mode);
                     BotModule.Mode botMode = "creative".equalsIgnoreCase(mode)     ? BotModule.Mode.CREATIVE_SURVEY
                                            : "void_scatter".equalsIgnoreCase(mode) ? BotModule.Mode.VOID_SCATTER
+                                           : ("adventure".equalsIgnoreCase(mode) || isBridge) ? BotModule.Mode.ADVENTURE_EXPLORE
                                            :                                          BotModule.Mode.SURVIVAL_GATHER;
+                    bot.setBridging(isBridge);
                     boolean wasRunning = bot.isRunning();
                     if (wasRunning) bot.stop();
                     bot.setMode(botMode);
@@ -88,8 +110,17 @@ public class SessionProtocol {
 
     /** Called by BlockscopeClient's DISCONNECT handler after stopping recording/bot. */
     public static void onDisconnect(MinecraftClient client) {
+        net.minecraft.text.Text reason = lastDisconnectReason;
+        lastDisconnectReason = null;
         if (!inManagedSession) return;
         inManagedSession = false;
+
+        // A user-initiated quit (Disconnect / Save-and-Quit) must NOT auto-reconnect —
+        // only server kicks (session end), timeouts, and the stuck-watchdog should.
+        if (isManualQuit(reason)) {
+            System.out.println("[Blockscope] Manual quit — not reconnecting");
+            return;
+        }
 
         Config cfg = Config.getInstance();
         if (!cfg.autoReconnect || lastServer == null) return;

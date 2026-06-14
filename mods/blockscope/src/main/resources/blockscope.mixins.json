@@ -4,6 +4,7 @@
   "package": "com.blockscope.mixin",
   "compatibilityLevel": "JAVA_17",
   "client": [
+    "ClientPlayNetworkHandlerMixin",
     "KeyboardMixin",
     "MinecraftClientMixin",
     "MouseMixin"

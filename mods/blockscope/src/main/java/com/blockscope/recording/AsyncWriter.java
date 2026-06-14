@@ -97,6 +97,8 @@ public class AsyncWriter {
         try {
             String url = serverUrl + "/stream-data?session_id=" + sessionId + "&data_type=" + dataType;
             HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+            conn.setConnectTimeout(2000);
+            conn.setReadTimeout(5000);
             conn.setRequestMethod("POST");
             conn.setDoOutput(true);
             conn.setRequestProperty("Content-Type", "application/x-ndjson");

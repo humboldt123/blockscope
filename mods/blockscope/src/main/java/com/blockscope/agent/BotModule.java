@@ -51,7 +51,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 public class BotModule {
 
-    public enum Mode { CREATIVE_SURVEY, SURVIVAL_GATHER, VOID_SCATTER }
+    public enum Mode { CREATIVE_SURVEY, SURVIVAL_GATHER, VOID_SCATTER, ADVENTURE_EXPLORE }
 
     private static BotModule instance;
     private final AtomicBoolean running = new AtomicBoolean(false);
@@ -69,6 +69,20 @@ public class BotModule {
     private boolean useFreeLook = false;
 
     private int torchCheckTicks = 0;
+
+    // Bridging mode (sky-island maps): allow placing throwaway blocks so Baritone
+    // can bridge across void between islands. Set by SessionProtocol from the "bridge"
+    // session mode before start().
+    private volatile boolean bridging = false;
+    public void setBridging(boolean b) { bridging = b; }
+
+    // Stuck watchdog: if the bot is running but the player hasn't moved for this long,
+    // the session is wedged (failed path, blocked map, etc.) — disconnect so the client
+    // auto-reconnects into a fresh world rather than burning the whole session stuck.
+    private static final long STUCK_TIMEOUT_MS = 15_000;
+    private double stuckX, stuckY, stuckZ;
+    private long   lastMoveMs;
+    private boolean stuckInit = false;
 
     // Structure positions received from Lodestone's StructureGuide channel.
     // Empty when not connected to a Lodestone server — bot falls back to
@@ -110,9 +124,10 @@ public class BotModule {
     public void cycleMode() {
         if (running.get()) { log("§c[Bot] Stop the bot before changing mode."); return; }
         mode = switch (mode) {
-            case CREATIVE_SURVEY -> Mode.SURVIVAL_GATHER;
-            case SURVIVAL_GATHER -> Mode.VOID_SCATTER;
-            case VOID_SCATTER    -> Mode.CREATIVE_SURVEY;
+            case CREATIVE_SURVEY   -> Mode.SURVIVAL_GATHER;
+            case SURVIVAL_GATHER   -> Mode.VOID_SCATTER;
+            case VOID_SCATTER      -> Mode.ADVENTURE_EXPLORE;
+            case ADVENTURE_EXPLORE -> Mode.CREATIVE_SURVEY;
         };
         log("§e[Bot] Mode → " + mode);
     }
@@ -123,12 +138,14 @@ public class BotModule {
 
     public void start() {
         if (running.getAndSet(true)) return;
+        stuckInit = false;
         applyGlobalSettings();
         log("§a[Bot] Starting — " + mode);
         botThread = new Thread(() -> {
             try {
                 if (mode == Mode.CREATIVE_SURVEY) runCreativeSurvey();
                 else if (mode == Mode.VOID_SCATTER) runVoidScatter();
+                else if (mode == Mode.ADVENTURE_EXPLORE) runAdventureExplore();
                 else runSurvivalGather();
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -150,6 +167,7 @@ public class BotModule {
         useFreeLook = false;
         lookInitialized = false;
         torchCheckTicks = 0;
+        stuckInit = false;
         cancelBaritone();
         if (botThread != null) { botThread.interrupt(); botThread = null; }
     }
@@ -157,6 +175,7 @@ public class BotModule {
     /** Called every game tick from BlockscopeClient. Drives look in creative survey; places torches in survival. */
     public void onTick(MinecraftClient mc) {
         if (!running.get() || mc.player == null) return;
+        if (checkStuck(mc)) return; // disconnected — bail
         tickTorchCheck(mc);
         if (!useFreeLook) return;
 
@@ -188,6 +207,35 @@ public class BotModule {
 
         mc.player.setYaw((float) lookYaw);
         mc.player.setPitch((float) lookPitch);
+    }
+
+    /**
+     * Watchdog: if the player hasn't moved more than ~1 block in STUCK_TIMEOUT_MS,
+     * the bot is wedged (failed path, blocked map). Disconnect so the client
+     * auto-reconnects into a fresh world. Returns true if a disconnect was issued.
+     */
+    private boolean checkStuck(MinecraftClient mc) {
+        long now = System.currentTimeMillis();
+        double x = mc.player.getX(), y = mc.player.getY(), z = mc.player.getZ();
+        if (!stuckInit) {
+            stuckX = x; stuckY = y; stuckZ = z; lastMoveMs = now; stuckInit = true;
+            return false;
+        }
+        double dx = x - stuckX, dy = y - stuckY, dz = z - stuckZ;
+        if (dx * dx + dy * dy + dz * dz > 1.0) {
+            stuckX = x; stuckY = y; stuckZ = z; lastMoveMs = now;
+            return false;
+        }
+        if (now - lastMoveMs > STUCK_TIMEOUT_MS) {
+            log("§c[Bot] Stuck " + (STUCK_TIMEOUT_MS / 1000) + "s — disconnecting for a new world");
+            stuckInit = false;
+            if (mc.getNetworkHandler() != null) {
+                mc.getNetworkHandler().getConnection().disconnect(
+                    Text.literal("blockscope: bot stuck — cycling world"));
+            }
+            return true;
+        }
+        return false;
     }
 
     // ── Torch placement ───────────────────────────────────────────────────────
@@ -293,6 +341,104 @@ public class BotModule {
         log("§b[Bot] Creative survey — flying from (" + startX + ", " + startZ + ")");
 
         while (running.get()) Thread.sleep(5_000);
+    }
+
+    // ── Adventure explore ─────────────────────────────────────────────────────
+
+    /**
+     * Walk-only exploration of a pre-built human-made map (build maps, old
+     * Hermitcraft worlds) in ADVENTURE game mode.  The bot must NEVER modify the
+     * world: no breaking, no placing, no scaffolding, no parkour-placing.  It
+     * pathfinds on foot at ground level, climbs stairs/ladders, and roams to cover
+     * the build for camera/perception data.
+     *
+     * NOTE: Baritone 1.9.5 has NO door/fence-gate-opening setting (verified via
+     * javap on baritone/api/Settings.class — the only right-click settings are
+     * rightClickSpeed and rightClickContainerOnArrival). Baritone treats a closed
+     * door as a passable block during pathing and will path up to it, but it does
+     * not actively right-click doors open. On maps with closed doors the bot may
+     * stall against them — test in-game; prefer maps with open doorways/archways
+     * or pre-opened doors.
+     */
+    private void runAdventureExplore() throws InterruptedException {
+        waitForPlayer();
+        MinecraftClient mc = MinecraftClient.getInstance();
+        // Baritone resets settings on new server connection — wait for that first.
+        Thread.sleep(3000);
+        // Break only if the SERVER put us in a gamemode that allows it. Library maps the
+        // server marks as "adventure_maps" (e.g. hermitcraft) come through in ADVENTURE
+        // gamemode → preserve them (no break). Everything else is SURVIVAL → the bot may
+        // break obstacles to free itself (it's a throwaway copy; the source is untouched).
+        boolean canBreak = mc.interactionManager == null
+            || mc.interactionManager.getCurrentGameMode() != net.minecraft.world.GameMode.ADVENTURE;
+        final boolean doBridge = bridging;
+        mc.execute(() -> {
+            var s = BaritoneAPI.getSettings();
+            s.allowBreak.value         = canBreak;
+            // Placing is enabled ONLY for sky-island (bridge) maps, so Baritone can
+            // bridge across void between islands using throwaway blocks. Otherwise the
+            // bot never places, so it can't junk up the build.
+            s.allowPlace.value         = doBridge;
+            s.allowParkour.value       = false;
+            s.allowParkourPlace.value  = false;
+            s.allowParkourAscend.value = false;
+            s.allowInventory.value     = false;
+            s.allowVines.value         = true;    // climb vines
+            if (doBridge) {
+                java.util.List<net.minecraft.item.Item> throwaway = new java.util.ArrayList<>();
+                throwaway.add(Items.COBBLESTONE);
+                s.acceptableThrowawayItems.value = throwaway;
+            }
+            // Walk on foot only — no flight, no creative abilities set here.
+            s.allowSprint.value        = true;
+            // Smooth free-look so the camera pans around naturally while walking.
+            s.freeLook.value           = true;
+        });
+        useFreeLook     = true;
+        lookInitialized = false;
+        Thread.sleep(200);
+
+        log("§b[Bot] Adventure explore — walking" + (canBreak ? " (can break)" : " (preserve, no break)")
+            + (doBridge ? " + bridging" : ""));
+
+        // Mostly explore horizontally, but every 3rd cycle nudge upward so the bot
+        // climbs ladders/stairs into upper floors instead of staying at ground level.
+        int cycle = 0;
+        while (running.get()) {
+            cycle++;
+            if (cycle % 3 == 0) climbNudge();
+            else exploreWalk(50);
+        }
+    }
+
+    /**
+     * Set a higher Y goal so Baritone seeks a way up (ladders, stairs, slopes) — gives
+     * the explorer an inclination to ascend multi-level builds rather than circling the
+     * ground floor. Bails after a short window so it never gets fixated.
+     */
+    private void climbNudge() throws InterruptedException {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc.player == null) { Thread.sleep(1000); return; }
+        int targetY = mc.player.getBlockY() + 6 + rng.nextInt(14);
+        mc.execute(() -> baritone().getCustomGoalProcess().setGoalAndPath(new GoalYLevel(targetY)));
+        for (int i = 0; i < 25 && running.get(); i++) {
+            Thread.sleep(1_000);
+            if (!baritone().getCustomGoalProcess().isActive()) break;
+        }
+        cancelBaritone();
+        Thread.sleep(300);
+    }
+
+    private void exploreWalk(int seconds) throws InterruptedException {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc.player == null) { Thread.sleep(1000); return; }
+        mc.execute(() -> baritone().getExploreProcess()
+            .explore(mc.player.getBlockX(), mc.player.getBlockZ()));
+        for (int i = 0; i < seconds && running.get(); i++) {
+            Thread.sleep(1_000);
+        }
+        cancelBaritone();
+        Thread.sleep(300);
     }
 
     // ── Survival gather ───────────────────────────────────────────────────────
