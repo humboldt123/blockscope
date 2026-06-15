@@ -133,6 +133,8 @@ if [ ! -d "$CTRL_DIR/node_modules" ]; then
     ( cd "$CTRL_DIR" && npm install --no-audit --no-fund )
   fi
 fi
+# Brief pause so the VPS connection-throttle window clears between camera + controller.
+sleep 6
 echo "[run:$INSTANCE] starting controller '$CONTROLLER_USER' -> $MC_HOST:$MC_PORT ..."
 ( cd "$CTRL_DIR" && node controller.js \
     --host "$MC_HOST" --port "$MC_PORT" --user "$CONTROLLER_USER" \
