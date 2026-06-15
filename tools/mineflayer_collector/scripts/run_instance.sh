@@ -21,7 +21,7 @@
 #   6. tear down the camera container. NO server, NO plugin build, NO port, NO worlds.
 #
 # Parameters (env or defaults). Headline knobs: GPU, EPISODE, DURATION.
-#   GPU            free GPU index (NEVER 0)                         [required]
+#   GPU            GPU index to use                                  [required]
 #   INSTANCE       instance id                                       [gpu<GPU>]
 #   EPISODE        controller episode (explore|walklook)             [explore]
 #   DURATION       seconds of episode activity                       [240]
@@ -35,8 +35,7 @@
 #   KEEP           1 = leave the camera container up after run       [0]
 set -euo pipefail
 
-GPU="${GPU:?set GPU (free index, never 0)}"
-[ "$GPU" = "0" ] && { echo "REFUSING GPU 0 (production collector)."; exit 1; }
+GPU="${GPU:?set GPU index}"
 
 COLLECTOR_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTANCE="${INSTANCE:-gpu${GPU}}"
