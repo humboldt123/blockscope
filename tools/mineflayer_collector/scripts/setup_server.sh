@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+# DEPRECATED (2026-06-15). The collector no longer runs Paper on Brev. The VPS
+# (mc.vivime.info:25566) owns all server-side work — worlds, the copy-on-join pool, and
+# pairing + teleport-mirror (now built into the Lodestone plugin, not this standalone
+# mirror plugin). run_instance.sh no longer calls this script; it only launches two
+# client processes (camera container + Mineflayer controller) against the VPS.
+# Kept for reference / single-box local testing only.
+#
 # Provision a per-instance Paper 1.19.4 server for the Blockscope mirror collector.
 #
 # Parametrized & collision-free: every instance gets its own SERVER_DIR, PORT, and

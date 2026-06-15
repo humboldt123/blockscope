@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
 # Launch N Blockscope collector instances in parallel, one per FREE GPU.
 #
-# Auto-detects free GPUs (nvidia-smi: ~0% util AND tiny mem use), NEVER uses GPU 0,
-# and gives each instance a unique GPU / port / usernames / X display / session+server
-# dir so parallel runs never collide. Each instance is a full run_instance.sh pipeline.
+# Each instance = 1 record-only camera container + 1 Mineflayer controller bot, BOTH
+# connecting to the VPS server (mc.vivime.info:25566). The VPS owns all worlds + pairing
+# + teleport-mirror. NO Paper servers on Brev, NO per-instance ports, NO world copying.
+#
+# Auto-detects free GPUs (nvidia-smi: ~0% util AND tiny mem use), NEVER uses GPU 0, and
+# gives each instance a unique GPU / X display / usernames (cam_<inst>/ctrl_<inst>) so
+# parallel runs never collide. Each instance is a full run_instance.sh pipeline.
 #
 # Usage:
 #   ./run_fleet.sh [N]                 # launch up to N instances on free GPUs (default: all free)
 #
 # Env (forwarded to every instance):
-#   WORLD, EPISODE, DURATION, CLIENT_DIR, IMAGE, HOPPER_URL, EXTRA_CTRL_ARGS, KEEP
+#   EPISODE, DURATION, CLIENT_DIR, IMAGE, HOPPER_URL, MC_HOST, MC_PORT, EXTRA_CTRL_ARGS, KEEP
 #   GPUS="7 4 6"   explicit GPU list (overrides auto-detect)
 #   MEM_FREE_MAX   max MiB used to call a GPU "free"            [200]
 set -euo pipefail
@@ -48,13 +52,14 @@ PIDS=()
 for gpu in "${FREE[@]}"; do
   echo "[fleet] -> instance gpu${gpu}"
   GPU="$gpu" INSTANCE="gpu${gpu}" \
-    WORLD="${WORLD:-}" EPISODE="${EPISODE:-explore}" DURATION="${DURATION:-240}" \
+    EPISODE="${EPISODE:-explore}" DURATION="${DURATION:-240}" \
+    MC_HOST="${MC_HOST:-mc.vivime.info}" MC_PORT="${MC_PORT:-25566}" \
     CLIENT_DIR="${CLIENT_DIR:-$HOME/blockscope_client}" IMAGE="${IMAGE:-blockscope-headless:latest}" \
     HOPPER_URL="${HOPPER_URL:-http://localhost:9000}" EXTRA_CTRL_ARGS="${EXTRA_CTRL_ARGS:-}" \
     KEEP="${KEEP:-0}" \
     bash "$COLLECTOR_ROOT/scripts/run_instance.sh" 2>&1 | sed "s/^/[gpu${gpu}] /" &
   PIDS+=($!)
-  sleep 8   # stagger so N Paper boots + Mojang/Fabric installs don't thundering-herd
+  sleep 8   # stagger so N Mojang/Fabric installs + VPS joins don't thundering-herd
 done
 
 echo "[fleet] all ${#FREE[@]} instances launched; waiting ..."
