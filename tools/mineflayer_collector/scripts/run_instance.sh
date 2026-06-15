@@ -125,7 +125,10 @@ docker run -d --rm \
 docker logs -f "$CONTAINER" > "$CAM_LOG" 2>&1 &
 
 echo "[run:$INSTANCE] waiting for camera '$CAMERA_USER' to join ..."
-for i in $(seq 1 120); do
+# Generous: a fresh container does a full Fabric+assets install and texture load on first
+# boot, which can exceed 2min when the box's other GPUs are busy. 300s avoids a spurious
+# "camera never joined" abort while the client is still legitimately loading.
+for i in $(seq 1 300); do
   grep -q "$CAMERA_USER joined the game" "$SERVER_LOG" 2>/dev/null && break
   sleep 1
 done
@@ -172,14 +175,35 @@ echo "[run:$INSTANCE] paired + recording. Driving episode for ${DURATION}s ..."
 wait "$CTRL_PID" || true
 echo "[run:$INSTANCE] controller finished."
 
-# --- 6. let the camera finish save + upload (.mcpr watcher needs a moment) -------
-echo "[run:$INSTANCE] stopping mirror + letting camera save/upload ..."
+# --- 6. cleanly stop the camera so it saves + uploads everything ------------------
+# The camera records for the full `startcam` window UNLESS it disconnects. We must give
+# it a CLEAN disconnect (not a container kill) so the mod's DISCONNECT handler fires:
+# stopRecording() -> finalize video -> ReplayMod writes the .mcpr -> the watcher uploads
+# it. Killing the container mid-recording (the old `mirror stop; sleep 20`) skipped all
+# of that, which is why earlier sessions had no .mcpr. So: unpair, then kick the camera,
+# then WAIT for the upload to actually complete before tearing anything down.
+echo "[run:$INSTANCE] stopping mirror + cleanly disconnecting camera to trigger save/upload ..."
 srv "mirror stop"
-sleep 20  # camera disconnect -> save video.mp4 / ticks / frame_mapping / .mcpr -> upload
+sleep 2
+srv "kick ${CAMERA_USER} session complete"
+
+# Poll the camera log for a terminal .mcpr outcome (upload complete OR watcher timeout).
+# Up to 150s: ReplayMod save of a ~2min replay + chunked upload to Hopper can take a while.
+echo "[run:$INSTANCE] waiting for .mcpr save + upload (camera disconnect -> save -> upload) ..."
+MCPR_OK=0
+for i in $(seq 1 150); do
+  if grep -qE '\.mcpr upload complete' "$CAM_LOG" 2>/dev/null; then MCPR_OK=1; break; fi
+  if grep -qE '\.mcpr watcher timed out' "$CAM_LOG" 2>/dev/null; then break; fi
+  sleep 1
+done
 
 LATEST_SESSION="$(grep -oE 'Recording started: session_[0-9]+' "$CAM_LOG" 2>/dev/null | tail -1 | awk '{print $3}')"
 echo "[run:$INSTANCE] camera session_id: ${LATEST_SESSION:-<unknown>}"
-echo "[run:$INSTANCE] mcpr upload status:"; grep -E '\.mcpr upload complete|\.mcpr watcher timed out' "$CAM_LOG" | tail -2 || true
+if [ "$MCPR_OK" = "1" ]; then
+  echo "[run:$INSTANCE] mcpr upload status: COMPLETE"
+else
+  echo "[run:$INSTANCE] mcpr upload status:"; grep -E '\.mcpr upload complete|\.mcpr watcher timed out|Uploading replay' "$CAM_LOG" | tail -3 || echo "  (no mcpr outcome logged)"
+fi
 echo "[run:$INSTANCE] modal/recovery check (should be EMPTY):"
 grep -iE 'offering recovery|has not quit normally|recover recording' "$CAM_LOG" | tail -5 || echo "  (none)"
 

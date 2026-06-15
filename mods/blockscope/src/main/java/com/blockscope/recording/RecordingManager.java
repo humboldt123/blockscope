@@ -126,16 +126,134 @@ public class RecordingManager {
      */
     public static void cleanupReplayRecoveryState(File runDir) {
         try {
+            // (1) Flag ourselves headless so our vendored ReplayMod skips its startup recovery
+            // scan (ReplayFilesService.initialScan) — the scan can never pop the recovery modal
+            // or race the live recording again. The container also sets BLOCKSCOPE_HEADLESS as a
+            // second, independent trigger of the same skip.
+            System.setProperty("blockscope.headless", "true");
+
             File base = new File(runDir, REPLAY_BASE_DIR);
-            if (!base.exists()) return;
-            int wiped = wipeRecoveryArtifacts(base, 0);
-            if (wiped > 0) {
-                System.out.println("[Blockscope] Cleared " + wiped +
-                    " stale ReplayMod recovery/temp artifact(s) from " + base);
+            if (base.exists()) {
+                int wiped = wipeRecoveryArtifacts(base, 0);
+                if (wiped > 0) {
+                    System.out.println("[Blockscope] Cleared " + wiped +
+                        " stale ReplayMod recovery/temp artifact(s) from " + base);
+                }
             }
+
+            // (2) Redirecting RECORDING_PATH happens lazily via ensureIsolatedReplayPath() — it
+            // CANNOT be done here at mod init because ReplayMod.instance is still null at this
+            // point (ReplayMod's client init runs after ours). See ensureIsolatedReplayPath().
         } catch (Exception e) {
             System.err.println("[Blockscope] Replay recovery cleanup failed: " + e.getMessage());
         }
+    }
+
+    /** Per-boot isolated ReplayMod recording dir; set once ReplayMod.instance is ready. */
+    private static volatile String bootReplayPath = null;
+    private static volatile boolean replayReady = false;
+    private static volatile boolean scanDirSet = false;
+    private static volatile long scanParkedAtMs = 0;
+    /** Max wall-clock to wait for initialScan after parking, before proceeding anyway. */
+    private static final long SCAN_SETTLE_MS = 12000;
+
+    /**
+     * Sequence ReplayMod's one-time startup recovery scan {@link
+     * com.replaymod.core.files.ReplayFilesService#initialScan} so it can NEVER race the live
+     * recording — the shared root cause of BOTH the "Found partially saved replay" recovery modal
+     * AND the missing/invalid {@code .mcpr}.
+     *
+     * <p>Why the earlier "just point at an empty isolated dir" attempt failed: ReplayMod's login
+     * mixin auto-starts recording on connect, writing the live file into
+     * {@code <RECORDING_PATH>/recording/}. {@code initialScan} (deferred to after the resource
+     * load) reads {@code getRecordingFolder()} == {@code <RECORDING_PATH>/recording/} at scan
+     * time and {@code Files.move()}s everything it finds there into the replay root — so whatever
+     * dir the live recording is in, if {@code initialScan} runs while it's recording, it yanks the
+     * file out from under the writer and offers recovery. Same race, just relocated.
+     *
+     * <p>Fix: a two-phase handshake, entirely client-side (no ReplayMod rebuild needed):
+     * <ol>
+     *   <li>Phase 1 — at first ready tick, point RECORDING_PATH at an empty {@code scan_<ts>/}
+     *       dir and do NOT connect yet. When {@code initialScan} runs it sees an empty tree → no
+     *       move, no modal.</li>
+     *   <li>Phase 2 — once {@code initialScan} has demonstrably finished (it spawns a daemon
+     *       thread named {@code replaymod-cleanup} as its final act), switch RECORDING_PATH to a
+     *       fresh {@code rec_<ts>/} dir and only THEN report ready so auto-connect proceeds. The
+     *       live recording now lands in a dir {@code initialScan} has already passed over and will
+     *       never scan again (it runs exactly once).</li>
+     * </ol>
+     *
+     * <p>Called every client tick from {@code BlockscopeClient}; gates auto-connect until it
+     * returns true. Must be driven from the tick loop (not mod init) because
+     * {@code ReplayMod.instance} is null during our {@code onInitializeClient}.
+     *
+     * @return true once it is safe to connect/record, false while still sequencing
+     */
+    public static boolean ensureIsolatedReplayPath() {
+        if (replayReady) return true;
+        try {
+            if (ReplayMod.instance == null) return false; // ReplayMod not initialized yet — retry next tick
+
+            // Phase 1: redirect to an empty scan dir so initialScan is a guaranteed no-op.
+            if (!scanDirSet) {
+                String scanRel = "./" + REPLAY_BASE_DIR + "/scan_" + Instant.now().getEpochSecond() + "/";
+                ReplayMod.instance.getSettingsRegistry().set(
+                    com.replaymod.core.Setting.RECORDING_PATH, scanRel);
+                ReplayMod.instance.folders.getReplayFolder();   // create empty scan tree
+                ReplayMod.instance.folders.getRecordingFolder(); // create empty recording/ subdir
+                scanDirSet = true;
+                scanParkedAtMs = System.currentTimeMillis();
+                System.out.println("[Blockscope] Phase 1: RECORDING_PATH parked at empty " + scanRel +
+                    " — waiting for ReplayMod initialScan to run (no-op) before connecting.");
+                return false;
+            }
+
+            // Phase 2: wait until initialScan has run against the (empty) scan dir before we connect.
+            // Primary signal: initialScan's final act spawns a daemon thread named
+            // "replaymod-cleanup". That thread is short-lived, so we may miss it between ticks —
+            // hence a wall-clock fallback: initialScan fires right after the resource reload, so a
+            // few seconds of settle time guarantees it has happened regardless. Either condition
+            // releases us; we never deadlock waiting for a signal we might have missed.
+            long waited = System.currentTimeMillis() - scanParkedAtMs;
+            if (!initialScanFinished() && waited < SCAN_SETTLE_MS) {
+                return false; // keep waiting, don't connect yet
+            }
+            if (!initialScanFinished()) {
+                System.out.println("[Blockscope] Phase 2: initialScan signal not observed after "
+                    + waited + "ms — proceeding (scan dir was empty, so a late scan is harmless).");
+            }
+
+            // initialScan done (or settle window elapsed). Switch to a fresh recording dir it has
+            // already passed over and — since it runs exactly once — will never scan again.
+            bootReplayPath = "./" + REPLAY_BASE_DIR + "/rec_" + Instant.now().getEpochSecond() + "/";
+            ReplayMod.instance.getSettingsRegistry().set(
+                com.replaymod.core.Setting.RECORDING_PATH, bootReplayPath);
+            String abs = ReplayMod.instance.folders.getReplayFolder().toAbsolutePath().toString();
+            replayReady = true;
+            System.out.println("[Blockscope] Phase 2: initialScan complete — RECORDING_PATH -> " + abs +
+                " (live recording is now isolated from the one-time recovery scan).");
+            return true;
+        } catch (Exception e) {
+            System.err.println("[Blockscope] Could not sequence replay path: " + e.getMessage());
+            return false;
+        }
+    }
+
+    /** True once ReplayMod's initialScan has run (it ends by spawning thread "replaymod-cleanup"). */
+    private static volatile boolean cleanupThreadSeen = false;
+    private static boolean initialScanFinished() {
+        if (cleanupThreadSeen) return true;
+        ThreadGroup root = Thread.currentThread().getThreadGroup();
+        while (root.getParent() != null) root = root.getParent();
+        Thread[] threads = new Thread[root.activeCount() + 16];
+        int n = root.enumerate(threads, true);
+        for (int i = 0; i < n; i++) {
+            if (threads[i] != null && "replaymod-cleanup".equals(threads[i].getName())) {
+                cleanupThreadSeen = true;
+                return true;
+            }
+        }
+        return false;
     }
 
     private static int wipeRecoveryArtifacts(File dir, int depth) {

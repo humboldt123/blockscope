@@ -79,6 +79,9 @@ def build_command(fabric_id: str) -> list:
         "jvmArguments": [
             "-Xmx4G",
             "-Djava.awt.headless=false",
+            # Tell our vendored ReplayMod to skip the startup recovery scan (no
+            # "recover recording?" modal, no race with the live recording).
+            "-Dblockscope.headless=true",
             # Fail fast & loud if GL init dies, so logs show the real error.
             "-Dfml.earlyprogresswindow=false",
         ],

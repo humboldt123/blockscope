@@ -170,6 +170,17 @@ public class BlockscopeClient implements ClientModInitializer {
     private static void maybeAutoConnect(net.minecraft.client.MinecraftClient client) {
         if (autoConnectAttempted) return;
 
+        // Isolate ReplayMod's RECORDING_PATH to a fresh per-boot subdir BEFORE we ever connect.
+        // This can only happen now (not at mod init) because ReplayMod.instance is null during
+        // our onInitializeClient. It neutralizes both the startup recovery modal and the
+        // .mcpr-save race (see RecordingManager.ensureIsolatedReplayPath). Don't initiate the
+        // auto-connect until it has succeeded — connecting fires ReplayMod's auto-record login
+        // mixin, which must land in the isolated dir, not the shared root.
+        if (!RecordingManager.ensureIsolatedReplayPath()) {
+            autoConnectIdleTicks = 0; // wait for ReplayMod to finish initializing
+            return;
+        }
+
         com.blockscope.util.Config cfg = com.blockscope.util.Config.getInstance();
         String host = cfg.autoconnectHost;
         if (host == null || host.isBlank()) {

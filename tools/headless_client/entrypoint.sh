@@ -13,6 +13,27 @@ SCREEN_DEPTH="${SCREEN_DEPTH:-24}"
 
 log() { echo "[entrypoint] $*"; }
 
+# Flag the headless collector so our vendored ReplayMod skips its startup recovery
+# scan (no "recover recording?" modal, no race with the live recording).
+export BLOCKSCOPE_HEADLESS=1
+
+# Force OpenAL Soft to the null driver. The container has no ALSA/Pulse device, and the
+# native OpenAL→ALSA probe can hang/wedge the render thread during sound init (intermittent
+# "Failed to open OpenAL device" that sometimes stalls the client before it reaches the title
+# screen). The null driver makes sound init a fast, deterministic no-op — we don't record audio.
+export ALSOFT_DRIVERS=null
+export SDL_AUDIODRIVER=dummy
+
+# Belt-and-suspenders: wipe any ReplayMod recordings left in the game dir before launch.
+# /app/game is normally fresh per --rm container, but if it is ever bind-mounted/persisted
+# a stale *.mcpr.tmp would otherwise be a recovery candidate. Removing the whole dir
+# guarantees ReplayMod boots against a clean tree.
+GAME_DIR="${BLOCKSCOPE_GAME_DIR:-/app/game}"
+if [[ -d "${GAME_DIR}/replay_recordings" ]]; then
+    log "Wiping stale ReplayMod recordings in ${GAME_DIR}/replay_recordings ..."
+    rm -rf "${GAME_DIR}/replay_recordings" || true
+fi
+
 cleanup() {
     log "Cleaning up ..."
     [[ -n "${XVFB_PID:-}" ]] && kill "$XVFB_PID" 2>/dev/null || true
