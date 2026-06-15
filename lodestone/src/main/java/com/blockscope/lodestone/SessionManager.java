@@ -668,7 +668,13 @@ public class SessionManager implements Listener {
                 scheduleToolCheck(player);
             }
             // Bridge maps also get cobblestone so Baritone can bridge across void.
-            if (isBridgeLibrary) giveBridgeBlocks(player);
+            if (isBridgeLibrary) {
+                giveBridgeBlocks(player);
+                // SkyWars/BedWars chests are empty in our downloaded maps (no game
+                // plugin fills them). Seed every chest in the world with random loot
+                // so the bot sees items in chests during interior exploration.
+                fillSkyWarsChests(finalWorld);
+            }
 
             String label = isLibrary ? ("library:" + source) : finalCategory;
             String spawnDesc = (chosen != null)
@@ -857,6 +863,57 @@ public class SessionManager implements Listener {
     /** Cobblestone for sky-island bridging (Baritone uses it as throwaway scaffolding). */
     private void giveBridgeBlocks(Player player) {
         for (int i = 0; i < 5; i++) player.getInventory().addItem(new ItemStack(Material.COBBLESTONE, 64));
+    }
+
+    // Period-accurate (1.8-era) loot pool for SkyWars chest filling.
+    // Chosen to show visually diverse items + blocks while staying pre-1.13.
+    private static final Material[] SKYWARS_LOOT = {
+        Material.IRON_INGOT, Material.GOLD_INGOT, Material.DIAMOND,
+        Material.IRON_SWORD, Material.IRON_PICKAXE, Material.IRON_HELMET,
+        Material.IRON_CHESTPLATE, Material.IRON_LEGGINGS, Material.IRON_BOOTS,
+        Material.STONE_SWORD, Material.STONE_PICKAXE, Material.STONE_AXE,
+        Material.BOW, Material.ARROW, Material.FLINT_AND_STEEL,
+        Material.ENDER_PEARL, Material.GOLDEN_APPLE, Material.BREAD,
+        Material.COOKED_BEEF, Material.COOKED_CHICKEN,
+        Material.OAK_PLANKS, Material.COBBLESTONE, Material.SAND,
+        Material.LEATHER_HELMET, Material.LEATHER_CHESTPLATE,
+        Material.CHAINMAIL_HELMET, Material.CHAINMAIL_CHESTPLATE,
+        Material.ENCHANTED_BOOK, Material.EXPERIENCE_BOTTLE,
+        Material.SNOWBALL, Material.FISHING_ROD, Material.COMPASS,
+        Material.COAL, Material.TORCH,
+        Material.TNT,
+    };
+
+    /**
+     * Scan every loaded chunk in the world for chest/trapped-chest block entities
+     * and fill any that are empty with a random selection of 1.8-era loot. This
+     * runs once at session start so downloaded SkyWars maps have items in their
+     * chests — making bot interior exploration see varied item textures.
+     */
+    private void fillSkyWarsChests(World world) {
+        int filled = 0;
+        for (org.bukkit.Chunk chunk : world.getLoadedChunks()) {
+            for (org.bukkit.block.BlockState state : chunk.getTileEntities()) {
+                if (!(state instanceof org.bukkit.block.Chest chest)) continue;
+                org.bukkit.inventory.Inventory inv = chest.getBlockInventory();
+                // Only fill if completely empty (don't overwrite maps that have loot)
+                if (inv.firstEmpty() != 0) continue;
+                // Place 4-8 random items in random slots
+                int count = 4 + rng.nextInt(5);
+                for (int i = 0; i < count; i++) {
+                    int slot = rng.nextInt(inv.getSize());
+                    Material mat = SKYWARS_LOOT[rng.nextInt(SKYWARS_LOOT.length)];
+                    int qty = 1 + rng.nextInt(mat == Material.ARROW || mat == Material.COBBLESTONE
+                        || mat == Material.OAK_PLANKS ? 16 : 3);
+                    if (inv.getItem(slot) == null)
+                        inv.setItem(slot, new ItemStack(mat, qty));
+                }
+                chest.update();
+                filled++;
+            }
+        }
+        if (filled > 0)
+            plugin.getLogger().info("fillSkyWarsChests: filled " + filled + " chests in " + world.getName());
     }
 
     @EventHandler
