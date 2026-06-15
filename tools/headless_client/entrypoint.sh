@@ -34,6 +34,15 @@ if [[ -d "${GAME_DIR}/replay_recordings" ]]; then
     rm -rf "${GAME_DIR}/replay_recordings" || true
 fi
 
+# Suppress vanilla tutorial hints (the "Move with WASD / Jump with Space" popup that
+# appears on first world join and stays on-screen until dismissed). The options.txt
+# key is written before Minecraft starts so the client never shows it.
+mkdir -p "${GAME_DIR}"
+if ! grep -q "tutorialStep:" "${GAME_DIR}/options.txt" 2>/dev/null; then
+    echo "tutorialStep:none" >> "${GAME_DIR}/options.txt"
+    log "Suppressed vanilla tutorial hints (tutorialStep:none)"
+fi
+
 cleanup() {
     log "Cleaning up ..."
     [[ -n "${XVFB_PID:-}" ]] && kill "$XVFB_PID" 2>/dev/null || true
