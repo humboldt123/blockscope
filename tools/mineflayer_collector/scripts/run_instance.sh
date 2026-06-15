@@ -106,6 +106,7 @@ docker run -d --rm \
   -e BLOCKSCOPE_USERNAME="${CAMERA_USER}" \
   -v "$CAM_DIR/mods:/assets/mods:ro" \
   -v "$CAM_DIR/blockscope.properties:/assets/blockscope.properties:ro" \
+  --tmpfs /app/game/replay_recordings:exec,size=512m \
   "$IMAGE" >/dev/null
 docker logs -f "$CONTAINER" > "$CAM_LOG" 2>&1 &
 

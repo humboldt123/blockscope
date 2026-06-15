@@ -194,6 +194,29 @@ public class RecordingManager {
         try {
             if (ReplayMod.instance == null) return false; // ReplayMod not initialized yet — retry next tick
 
+            // In headless mode the entrypoint already wiped replay_recordings before
+            // launch, so initialScan has nothing to scan and cannot race the live
+            // recording. Skip the Phase 1 park / Phase 2 switch entirely — each
+            // RECORDING_PATH change triggers ReplayMod to reinitialize its
+            // PacketListener and terminate the previous thread pool, so the two-phase
+            // redirect was the very thing killing recording after ~2s.
+            // Just set a single fresh per-boot dir once and never change it again.
+            boolean headless = "true".equals(System.getProperty("blockscope.headless"))
+                || "1".equals(System.getenv("BLOCKSCOPE_HEADLESS"));
+            if (headless) {
+                bootReplayPath = "./" + REPLAY_BASE_DIR + "/rec_" + Instant.now().getEpochSecond() + "/";
+                ReplayMod.instance.getSettingsRegistry().set(
+                    com.replaymod.core.Setting.RECORDING_PATH, bootReplayPath);
+                replayReady = true;
+                String abs = ReplayMod.instance.folders.getReplayFolder().toAbsolutePath().toString();
+                System.out.println("[Blockscope] Headless: RECORDING_PATH -> " + abs
+                    + " (no Phase 1/2 scan sequencing needed; entrypoint wiped replay_recordings).");
+                return true;
+            }
+
+            // Non-headless (interactive / Windows client): use the original Phase 1/2 mechanism
+            // to sequence around initialScan which may try to recover an orphaned .mcpr.tmp.
+
             // Phase 1: redirect to an empty scan dir so initialScan is a guaranteed no-op.
             if (!scanDirSet) {
                 String scanRel = "./" + REPLAY_BASE_DIR + "/scan_" + Instant.now().getEpochSecond() + "/";
@@ -208,23 +231,15 @@ public class RecordingManager {
                 return false;
             }
 
-            // Phase 2: wait until initialScan has run against the (empty) scan dir before we connect.
-            // Primary signal: initialScan's final act spawns a daemon thread named
-            // "replaymod-cleanup". That thread is short-lived, so we may miss it between ticks —
-            // hence a wall-clock fallback: initialScan fires right after the resource reload, so a
-            // few seconds of settle time guarantees it has happened regardless. Either condition
-            // releases us; we never deadlock waiting for a signal we might have missed.
             long waited = System.currentTimeMillis() - scanParkedAtMs;
             if (!initialScanFinished() && waited < SCAN_SETTLE_MS) {
-                return false; // keep waiting, don't connect yet
+                return false;
             }
             if (!initialScanFinished()) {
                 System.out.println("[Blockscope] Phase 2: initialScan signal not observed after "
                     + waited + "ms — proceeding (scan dir was empty, so a late scan is harmless).");
             }
 
-            // initialScan done (or settle window elapsed). Switch to a fresh recording dir it has
-            // already passed over and — since it runs exactly once — will never scan again.
             bootReplayPath = "./" + REPLAY_BASE_DIR + "/rec_" + Instant.now().getEpochSecond() + "/";
             ReplayMod.instance.getSettingsRegistry().set(
                 com.replaymod.core.Setting.RECORDING_PATH, bootReplayPath);
