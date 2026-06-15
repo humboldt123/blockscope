@@ -885,35 +885,46 @@ public class SessionManager implements Listener {
     };
 
     /**
-     * Scan every loaded chunk in the world for chest/trapped-chest block entities
-     * and fill any that are empty with a random selection of 1.8-era loot. This
-     * runs once at session start so downloaded SkyWars maps have items in their
-     * chests — making bot interior exploration see varied item textures.
+     * Fill chests in a single chunk with 1.8-era loot. Called both at session
+     * start (for already-loaded spawn chunks) and from the ChunkLoadEvent listener
+     * (for chunks the bot loads later while bridging to new islands).
+     * Only fills completely empty chests — never overwrites loot that's already there.
+     * Returns the number of chests filled.
      */
+    int fillChunkChests(org.bukkit.Chunk chunk) {
+        int filled = 0;
+        for (org.bukkit.block.BlockState state : chunk.getTileEntities()) {
+            if (!(state instanceof org.bukkit.block.Chest chest)) continue;
+            org.bukkit.inventory.Inventory inv = chest.getBlockInventory();
+            if (inv.firstEmpty() != 0) continue; // already has items
+            int count = 4 + rng.nextInt(5);
+            for (int i = 0; i < count; i++) {
+                int slot = rng.nextInt(inv.getSize());
+                Material mat = SKYWARS_LOOT[rng.nextInt(SKYWARS_LOOT.length)];
+                int qty = 1 + rng.nextInt(mat == Material.ARROW || mat == Material.COBBLESTONE
+                    || mat == Material.OAK_PLANKS ? 16 : 3);
+                if (inv.getItem(slot) == null)
+                    inv.setItem(slot, new ItemStack(mat, qty));
+            }
+            chest.update();
+            filled++;
+        }
+        return filled;
+    }
+
+    /** Seed all already-loaded chunks at session start. */
     private void fillSkyWarsChests(World world) {
         int filled = 0;
-        for (org.bukkit.Chunk chunk : world.getLoadedChunks()) {
-            for (org.bukkit.block.BlockState state : chunk.getTileEntities()) {
-                if (!(state instanceof org.bukkit.block.Chest chest)) continue;
-                org.bukkit.inventory.Inventory inv = chest.getBlockInventory();
-                // Only fill if completely empty (don't overwrite maps that have loot)
-                if (inv.firstEmpty() != 0) continue;
-                // Place 4-8 random items in random slots
-                int count = 4 + rng.nextInt(5);
-                for (int i = 0; i < count; i++) {
-                    int slot = rng.nextInt(inv.getSize());
-                    Material mat = SKYWARS_LOOT[rng.nextInt(SKYWARS_LOOT.length)];
-                    int qty = 1 + rng.nextInt(mat == Material.ARROW || mat == Material.COBBLESTONE
-                        || mat == Material.OAK_PLANKS ? 16 : 3);
-                    if (inv.getItem(slot) == null)
-                        inv.setItem(slot, new ItemStack(mat, qty));
-                }
-                chest.update();
-                filled++;
-            }
-        }
+        for (org.bukkit.Chunk chunk : world.getLoadedChunks())
+            filled += fillChunkChests(chunk);
         if (filled > 0)
-            plugin.getLogger().info("fillSkyWarsChests: filled " + filled + " chests in " + world.getName());
+            plugin.getLogger().info("fillSkyWarsChests: seeded " + filled + " chests in " + world.getName());
+    }
+
+    /** True if the named world is one of our bridge (skywars/bedwars) session worlds. */
+    boolean isBridgeSessionWorld(String worldName) {
+        String src = librarySource.get(worldName);
+        return src != null && isBridgeSource(src);
     }
 
     @EventHandler
