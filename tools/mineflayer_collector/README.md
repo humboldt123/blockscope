@@ -1,8 +1,16 @@
 # Blockscope Mineflayer Collector (productionized)
 
-A hardened, parametrized, per-instance data-collection stack: one **Paper 1.19.4 server +
-BlockscopeMirror plugin + record-only Blockscope camera client + Mineflayer controller**,
-plus a fleet launcher that runs N of them in parallel (one per free GPU).
+A hardened, parametrized data-collection stack. **The VPS (`mc.vivime.info:25566`) runs
+Paper + Lodestone and owns ALL server-side work** — worlds, the copy-on-join pool, and
+pairing + teleport-mirror (built into the Lodestone plugin). **Brev runs ONLY clients**:
+per session, one **record-only Blockscope camera client** + one **Mineflayer controller**,
+both connecting to the VPS. A fleet launcher runs N sessions in parallel (one per free GPU).
+No Paper, no worlds, and no per-instance port management on Brev.
+
+Pairing is by username convention: the controller connects as `ctrl_<id>` and its camera as
+`cam_<id>`. Lodestone detects the prefixes, lands the pair in the SAME world, teleport-mirrors
+the camera onto the controller each tick, and sends the camera a `blockscope:session_start`
+so the mod records. (`/mirrorpair <ctrl> <cam>` is an op debug override.)
 
 This replaces the `mineflayer_prototype/` rig. **Approach A**: a single Mineflayer controller
 bot drives an exploration episode; the Paper plugin teleport-mirrors a *record-only* camera
@@ -14,11 +22,13 @@ build maps. The camera **never** paths, so labels stay valid.
 ```
 controller/controller.js     tuned Mineflayer controller (distance-scaled timeouts, waypointing)
 controller/package.json      mineflayer + mineflayer-pathfinder deps
-mirror_plugin/               BlockscopeMirror Paper plugin (teleport-mirror + session_start)
-scripts/setup_server.sh      provision ONE per-instance Paper server (unique dir/port/world)
-scripts/run_instance.sh      run ONE full session end-to-end (server+camera+controller+pair+save)
-scripts/run_fleet.sh         launch N instances on free GPUs, unique everything
+mirror_plugin/               (legacy) standalone BlockscopeMirror plugin — pairing now lives in Lodestone
+scripts/setup_server.sh      DEPRECATED — Brev no longer runs Paper; kept for local single-box testing
+scripts/run_instance.sh      run ONE session: camera container + controller bot against the VPS
+scripts/run_fleet.sh         launch N sessions on free GPUs (clients only — no Paper)
 ```
+Server-side pairing + teleport-mirror lives in `lodestone/` (`MirrorPairManager`), deployed to
+the VPS, not in this dir's `mirror_plugin/` (now legacy).
 
 ## The two ReplayMod bugs this fixes (and how)
 
@@ -55,34 +65,34 @@ This is a **real fix in code** (no zip-the-temp-dir hack), built into
 
 ## Launch ONE instance (proof / single run)
 ```bash
-# on the Brev box, from this dir's scripts/
+# on the Brev box, from this dir's scripts/ (the VPS must be up with the pairing-capable Lodestone)
 GPU=7 EPISODE=explore DURATION=240 bash scripts/run_instance.sh
-# optional: WORLD=/path/to/build_map  LEVEL_TYPE=normal  EXTRA_CTRL_ARGS="--waypoint-step 24 --think-timeout 15000"
+# optional: EXTRA_CTRL_ARGS="--waypoint-step 24 --think-timeout 15000"  MC_HOST=...  MC_PORT=...
 ```
 Produces (uploaded to Hopper under a fresh `session_<id>`): `video.mp4`, `ticks.jsonl`,
-`frame_mapping.jsonl`, and a **valid `.mcpr`**. Tears down the server + container and frees the
-port on exit (`KEEP=1` to leave them up).
+`frame_mapping.jsonl`, and a **valid `.mcpr`**. Tears down the camera container on exit
+(`KEEP=1` to leave it up). No server teardown — the VPS owns and recycles the world.
 
 ## Launch K instances (fleet)
 ```bash
 bash scripts/run_fleet.sh            # all free GPUs (never GPU 0)
 bash scripts/run_fleet.sh 3          # up to 3 instances
-GPUS="7 6 4" WORLD=/path/to/map bash scripts/run_fleet.sh
+GPUS="7 6 4" bash scripts/run_fleet.sh
 ```
-Each instance gets a unique GPU, port (`25600+gpu`), usernames (`cam_gpu<N>`/`ctrl_gpu<N>`),
-X display (`:99+gpu`), and server/session dir under `~/blockscope_collector/<instance>/`, so
-parallel instances never collide. `run_fleet.sh` auto-detects free GPUs (≤200 MiB used AND
-≤5% util), excludes GPU 0, and staggers boots to avoid a thundering herd.
+Each instance gets a unique GPU, usernames (`cam_gpu<N>`/`ctrl_gpu<N>`), and X display
+(`:99+gpu`), so parallel sessions never collide — all against the one VPS server.
+`run_fleet.sh` auto-detects free GPUs (≤200 MiB used AND ≤5% util), excludes GPU 0, and
+staggers boots to avoid a thundering herd.
 
 ## Parameters (env)
 | var | default | meaning |
 |-----|---------|---------|
 | `GPU` | (required) | free GPU index, never 0 |
-| `WORLD` | (generate) | build-map dir to load |
 | `EPISODE` | `explore` | controller episode |
 | `DURATION` | `240` | seconds of episode activity |
-| `PORT` | `25600+GPU` | server port |
+| `MC_HOST` | `mc.vivime.info` | VPS Minecraft host |
+| `MC_PORT` | `25566` | VPS Minecraft port |
 | `CLIENT_DIR` | `~/blockscope_client` | blockscope mods + properties source |
 | `HOPPER_URL` | `http://localhost:9000` | upload endpoint |
 | `EXTRA_CTRL_ARGS` | — | passthrough tuning to controller.js |
-| `KEEP` | `0` | leave server/container up after run |
+| `KEEP` | `0` | leave the camera container up after run |
