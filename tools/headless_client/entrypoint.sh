@@ -37,11 +37,26 @@ fi
 # Suppress vanilla tutorial hints (the "Move with WASD / Jump with Space" popup that
 # appears on first world join and stays on-screen until dismissed). The options.txt
 # key is written before Minecraft starts so the client never shows it.
+#
+# Also randomize visual settings (gamma/brightness and FOV) each launch so the
+# dataset covers a range of visual conditions rather than always using defaults.
+#   gamma: float [0.0, 1.0]  (0.0 = moody/default, 1.0 = full bright)
+#   fov:   integer [60, 110] (stored as actual degrees in options.txt)
 mkdir -p "${GAME_DIR}"
-if ! grep -q "tutorialStep:" "${GAME_DIR}/options.txt" 2>/dev/null; then
-    echo "tutorialStep:none" >> "${GAME_DIR}/options.txt"
-    log "Suppressed vanilla tutorial hints (tutorialStep:none)"
-fi
+
+RAND_GAMMA=$(python3 -c "import random; print(round(random.uniform(0.0, 1.0), 2))")
+RAND_FOV=$(python3 -c "import random; print(random.randint(60, 110))")
+log "Randomized visual settings: gamma=${RAND_GAMMA} fov=${RAND_FOV}"
+
+# Write/replace all three keys idempotently: sed out any existing line then re-append.
+# This works whether options.txt is empty, missing, or has stale values.
+touch "${GAME_DIR}/options.txt"
+for key in tutorialStep gamma fov; do
+    sed -i "/^${key}:/d" "${GAME_DIR}/options.txt"
+done
+printf 'tutorialStep:none\ngamma:%s\nfov:%s\n' "${RAND_GAMMA}" "${RAND_FOV}" \
+    >> "${GAME_DIR}/options.txt"
+log "options.txt: tutorialStep=none gamma=${RAND_GAMMA} fov=${RAND_FOV}"
 
 cleanup() {
     log "Cleaning up ..."
