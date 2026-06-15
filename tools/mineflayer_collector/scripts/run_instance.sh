@@ -134,7 +134,9 @@ if [ ! -d "$CTRL_DIR/node_modules" ]; then
   fi
 fi
 # Brief pause so the VPS connection-throttle window clears between camera + controller.
-sleep 6
+# Default throttle is 4s — 10s gives a wide margin. Set connection-throttle=-1 on
+# the VPS to remove this entirely (needs server.properties edit + restart).
+sleep 10
 echo "[run:$INSTANCE] starting controller '$CONTROLLER_USER' -> $MC_HOST:$MC_PORT ..."
 ( cd "$CTRL_DIR" && node controller.js \
     --host "$MC_HOST" --port "$MC_PORT" --user "$CONTROLLER_USER" \
