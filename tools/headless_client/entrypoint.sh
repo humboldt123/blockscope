@@ -44,18 +44,19 @@ fi
 #   fov:   integer [60, 110] (stored as actual degrees in options.txt)
 mkdir -p "${GAME_DIR}"
 
+# Wipe options.txt entirely each launch so stale values (e.g. an internal FOV unit
+# from a previous run) never survive into the next session. Minecraft writes its own
+# defaults for any missing keys, so a fresh file is always safe.
+rm -f "${GAME_DIR}/options.txt"
+
 RAND_GAMMA=$(python3 -c "import random; print(round(random.uniform(0.0, 1.0), 2))")
 RAND_FOV=$(python3 -c "import random; print(random.randint(60, 110))")
 log "Randomized visual settings: gamma=${RAND_GAMMA} fov=${RAND_FOV}"
 
-# Write/replace all three keys idempotently: sed out any existing line then re-append.
-# This works whether options.txt is empty, missing, or has stale values.
-touch "${GAME_DIR}/options.txt"
-for key in tutorialStep gamma fov; do
-    sed -i "/^${key}:/d" "${GAME_DIR}/options.txt"
-done
+# Write a clean options.txt with just the keys we care about. Minecraft fills
+# all other keys with defaults on first run.
 printf 'tutorialStep:none\ngamma:%s\nfov:%s\n' "${RAND_GAMMA}" "${RAND_FOV}" \
-    >> "${GAME_DIR}/options.txt"
+    > "${GAME_DIR}/options.txt"
 log "options.txt: tutorialStep=none gamma=${RAND_GAMMA} fov=${RAND_FOV}"
 
 cleanup() {
