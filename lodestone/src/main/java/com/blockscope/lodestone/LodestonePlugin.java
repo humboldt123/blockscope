@@ -7,6 +7,7 @@ public class LodestonePlugin extends JavaPlugin {
     private static LodestonePlugin instance;
     private SessionManager sessionManager;
     private ConnectionGuard connectionGuard;
+    private MirrorPairManager pairManager;
 
     @Override
     public void onEnable() {
@@ -15,6 +16,8 @@ public class LodestonePlugin extends JavaPlugin {
 
         sessionManager  = new SessionManager(this);
         connectionGuard = new ConnectionGuard(this);
+        pairManager     = new MirrorPairManager(this, sessionManager);
+        sessionManager.setPairManager(pairManager);
         // StructureGuide disabled: locateNearestStructure() blocks the main thread for 10+s
         // via NoiseBasedChunkGenerator.getBaseHeight() → vanilla density function tree.
         // TODO: move structure scanning to an async task or remove entirely.
@@ -31,6 +34,10 @@ public class LodestonePlugin extends JavaPlugin {
         getCommand("maps").setExecutor(mapCommand);
         getCommand("visit").setExecutor(mapCommand);
         getCommand("visit").setTabCompleter(mapCommand);
+
+        // Manual (controller, camera) mirror override for debugging.
+        getCommand("mirrorpair").setExecutor((sender, cmd, label, args) ->
+            pairManager.handleMirrorPair(sender, args));
 
         sessionManager.startWorldPool();
         getLogger().info("Lodestone enabled.");

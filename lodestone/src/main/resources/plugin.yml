@@ -24,6 +24,10 @@ commands:
     description: Serve a fresh copy of a specific library source map and teleport in (op only).
     usage: /visit <source>
     permission: blockscope.maps
+  mirrorpair:
+    description: Manually teleport-mirror a camera onto a controller (op debug override).
+    usage: /mirrorpair <controller> <camera> | /mirrorpair stop
+    permission: blockscope.maps
 
 permissions:
   blockscope.spawn:

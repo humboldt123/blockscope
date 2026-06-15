@@ -75,6 +75,10 @@ public class SessionManager implements Listener {
     private final Queue<World> voidPool     = new ConcurrentLinkedQueue<>();
     private final Queue<World> libraryPool  = new ConcurrentLinkedQueue<>();
     private final Map<UUID, World> playerWorlds = new ConcurrentHashMap<>();
+    // Paired-camera UUIDs: registered in playerWorlds (so damage/respawn guards + teleport
+    // back work) but they SHARE the controller's world, so their endSession must NOT delete
+    // it — only the controller (world owner) tears the world down.
+    private final java.util.Set<UUID> pairCameras = ConcurrentHashMap.newKeySet();
     private final Map<UUID, Integer> toolCheckTasks = new ConcurrentHashMap<>();
     private final Map<UUID, Integer> sessionTimers = new ConcurrentHashMap<>();
 
@@ -87,6 +91,9 @@ public class SessionManager implements Listener {
     });
 
     private int modeIndex = 0;
+
+    // Paired (controller, camera) sessions — purely additive (see MirrorPairManager).
+    private MirrorPairManager pairManager;
 
     public SessionManager(LodestonePlugin plugin) {
         this.plugin = plugin;
@@ -119,6 +126,24 @@ public class SessionManager implements Listener {
             default            -> WorldType.MODERN;
         };
 
+    }
+
+    /** Wired up in LodestonePlugin.onEnable so the paired path can drive teardown. */
+    public void setPairManager(MirrorPairManager pairManager) { this.pairManager = pairManager; }
+
+    /** Exposed so the paired path can use the same session duration on its session_start. */
+    public int getSessionDurationSeconds() { return sessionDurationSeconds; }
+
+    /**
+     * Register a paired CAMERA in the same world as its controller, so the existing
+     * damage/respawn guards (which key on bs_* worlds + playerWorlds) protect it. The
+     * camera shares the controller's world, so its teardown must NOT delete the world —
+     * see {@link #pairCameras}. No session timer is set: the timer belongs to the
+     * controller, and a pair ends when either member disconnects.
+     */
+    void registerPairCamera(Player camera, World world) {
+        pairCameras.add(camera.getUniqueId());
+        playerWorlds.put(camera.getUniqueId(), world);
     }
 
     // ── World pool ─────────────────────────────────────────────────────────────
@@ -557,6 +582,15 @@ public class SessionManager implements Listener {
         Player player = event.getPlayer();
         event.joinMessage(null);
 
+        // Paired (controller, camera) path — purely additive. A camera (cam_<id>) does NOT
+        // go through the normal pool/assignMode flow: it is teleported into the world its
+        // controller already holds and mirror-followed. A controller (ctrl_<id>) goes
+        // through the normal flow below but has its assigned world recorded for the camera.
+        if (pairManager != null && MirrorPairManager.isCamera(player.getName())) {
+            pairManager.onCameraJoin(player);
+            return;
+        }
+
         String category = assignMode(); // "void" | "survival" | "library"
 
         // Resolve a world for the chosen category. Library worlds come only from the
@@ -593,6 +627,12 @@ public class SessionManager implements Listener {
 
         playerWorlds.put(player.getUniqueId(), world);
         refillPool();
+
+        // If this is a paired controller (ctrl_<id>), remember the world so its camera
+        // (cam_<id>) lands in the SAME world when it joins.
+        if (pairManager != null && MirrorPairManager.isController(player.getName())) {
+            pairManager.onControllerAssigned(player, world);
+        }
 
         final World finalWorld = world;
         final String finalCategory = category;
@@ -822,7 +862,22 @@ public class SessionManager implements Listener {
     @EventHandler
     public void onPlayerQuit(PlayerQuitEvent event) {
         event.quitMessage(null);
-        endSession(event.getPlayer(), "disconnect");
+        Player player = event.getPlayer();
+
+        // Paired path: when EITHER member of a (controller, camera) pair disconnects,
+        // cancel the mirror task and end the partner's session too (kick it so it can
+        // reconnect into a fresh pair). The partner's world teardown then flows through
+        // the same endSession path below for that player.
+        if (pairManager != null && MirrorPairManager.isPaired(player.getName())) {
+            Player partner = pairManager.onPairedQuit(player);
+            if (partner != null && partner.isOnline()) {
+                partner.kick(net.kyori.adventure.text.Component.text("§aPair session ended — reconnecting…"));
+                // The kick fires another PlayerQuitEvent for the partner, which runs
+                // endSession() for it. End this player's session now.
+            }
+        }
+
+        endSession(player, "disconnect");
     }
 
     private void endSession(Player player, String reason) {
@@ -840,6 +895,13 @@ public class SessionManager implements Listener {
 
         if ("timeout".equals(reason) && player.isOnline()) {
             player.kick(net.kyori.adventure.text.Component.text("§aSession complete — reconnecting…"));
+        }
+
+        // Paired CAMERA: it shares the controller's world, so do NOT delete the world here
+        // (the controller, as world owner, tears it down). Just drop its entry.
+        if (pairCameras.remove(uuid)) {
+            plugin.getLogger().info("Pair camera left; world " + world.getName() + " owned by controller (not deleting here).");
+            return;
         }
 
         // All session worlds — including library copies — are throwaway and deleted.
