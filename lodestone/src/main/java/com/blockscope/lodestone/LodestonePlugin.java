@@ -24,6 +24,7 @@ public class LodestonePlugin extends JavaPlugin {
 
         getServer().getPluginManager().registerEvents(connectionGuard, this);
         getServer().getPluginManager().registerEvents(sessionManager, this);
+        getServer().getPluginManager().registerEvents(pairManager, this);
 
         // Fill chests in every chunk that loads in a bridge (skywars/bedwars) world.
         // This covers islands the bot bridges to AFTER session start — those chunks

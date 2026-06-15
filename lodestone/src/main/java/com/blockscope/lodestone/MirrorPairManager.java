@@ -5,6 +5,8 @@ import org.bukkit.GameMode;
 import org.bukkit.Location;
 import org.bukkit.World;
 import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.Listener;
 import org.bukkit.scheduler.BukkitTask;
 import org.bukkit.util.Vector;
 
@@ -41,7 +43,7 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * <p>Any non-prefixed connection falls through untouched to the existing assignMode flow.
  */
-public class MirrorPairManager {
+public class MirrorPairManager implements Listener {
 
     static final String CTRL_PREFIX = "ctrl_";
     static final String CAM_PREFIX  = "cam_";
@@ -64,6 +66,38 @@ public class MirrorPairManager {
     public MirrorPairManager(LodestonePlugin plugin, SessionManager sessions) {
         this.plugin = plugin;
         this.sessions = sessions;
+    }
+
+    // ── Spawn-location intercept ────────────────────────────────────────────────
+
+    /**
+     * Intercept the camera's initial spawn location BEFORE it joins, placing it
+     * directly in the controller's world. This avoids a cross-world teleport after
+     * join, which would send a Respawn packet and cause ReplayMod to stop/restart
+     * its recording (leaving the thread pool in a terminated state).
+     *
+     * If the controller's world isn't known yet (camera joined before controller),
+     * we leave the spawn location alone and let the retry mechanism in {@link
+     * #tryStartMirror} handle it — but that path still does a cross-world TP.
+     * In practice, the controller always joins 10 s before the camera, so this
+     * event fires with pairWorlds already populated.
+     */
+    @EventHandler
+    public void onCameraSpawnLocation(org.spigotmc.event.player.PlayerSpawnLocationEvent event) {
+        Player player = event.getPlayer();
+        if (!isCamera(player.getName())) return;
+        String id = pairIdOf(player.getName());
+        if (id == null) return;
+        World world = pairWorlds.get(id);
+        if (world == null) return; // controller not yet assigned; fall back to cross-TP path
+        UUID ctrlUuid = controllerOf.get(id);
+        Player ctrl = (ctrlUuid != null) ? Bukkit.getPlayer(ctrlUuid) : null;
+        Location spawnLoc = (ctrl != null && ctrl.isOnline())
+            ? ctrl.getLocation().clone()
+            : world.getSpawnLocation();
+        event.setSpawnLocation(spawnLoc);
+        plugin.getLogger().info("[pair] camera " + player.getName()
+            + " spawn intercepted → " + world.getName() + " (no Respawn packet)");
     }
 
     // ── Naming helpers ──────────────────────────────────────────────────────────
@@ -145,9 +179,16 @@ public class MirrorPairManager {
         camera.setInvulnerable(true);
         camera.setCollidable(false);
 
-        // Snap onto the controller immediately (this is what moves the camera into the
-        // controller's world), then start the per-tick follow.
-        camera.teleport(controller.getLocation().clone());
+        // Only teleport if the camera isn't already in the controller's world.
+        // When PlayerSpawnLocationEvent placed the camera in the right world at join
+        // time, a cross-world teleport here would send a Respawn packet and kill
+        // ReplayMod's packet-writer thread pool. Within-world teleports are safe.
+        if (camera.getWorld() != world) {
+            camera.teleport(controller.getLocation().clone());
+        } else {
+            // Already in the right world — just snap to the controller's position.
+            camera.teleport(controller.getLocation().clone());
+        }
 
         // Mutual invisibility so neither appears in the other's view / recording.
         controller.hidePlayer(plugin, camera);
