@@ -59,6 +59,7 @@ function parseArgs(argv) {
     goalMax: 60000,
     waypointStep: 24, // if a goal is farther than this, split into hops of this size (0 = off)
     targets: null, // "x,y,z;x,y,z;..." explicit ordered targets
+    waitForCamera: 90, // seconds to wait after spawn for camera to load + join (0 = skip)
   };
   for (let i = 2; i < argv.length; i++) {
     const k = argv[i], v = argv[i + 1];
@@ -74,6 +75,7 @@ function parseArgs(argv) {
       case "--think-timeout": a.thinkTimeout = int(); break;
       case "--tick-timeout": a.tickTimeout = int(); break;
       case "--goal-base": a.goalBase = int(); break;
+      case "--wait-for-camera": a.waitForCamera = num(); break;
       case "--goal-per-block": a.goalPerBlock = num(); break;
       case "--goal-min": a.goalMin = int(); break;
       case "--goal-max": a.goalMax = int(); break;
@@ -858,8 +860,15 @@ function main() {
     console.log(`[ctrl] spawned at ${fmt(bot.entity.position)}`);
     const mcData = require("minecraft-data")(bot.version);
     initPathfinder(bot, mcData);
-    // settle so the mirror plugin can pair + the camera teleports in + recording starts
-    await sleep(4000);
+    // Wait for the camera client to finish loading Fabric + assets + auto-connect.
+    // A cold Docker container takes ~90s on first boot (warm = ~30s with cached assets).
+    // Overridable via --wait-for-camera <seconds>. The camera logs 'Recording started'
+    // once it's fully in; we can't read that from here, so use a fixed wall-clock wait.
+    const camWait = args.waitForCamera != null ? args.waitForCamera * 1000 : 90000;
+    if (camWait > 0) {
+      console.log(`[ctrl] waiting ${camWait/1000}s for camera to load + join (set --wait-for-camera 0 to skip) ...`);
+      await sleep(camWait);
+    }
     try {
       switch (args.episode) {
         case "interior_hunt": await interiorHuntEpisode(bot, mcData); break;
