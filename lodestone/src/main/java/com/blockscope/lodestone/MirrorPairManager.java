@@ -89,7 +89,15 @@ public class MirrorPairManager implements Listener {
         String id = pairIdOf(player.getName());
         if (id == null) return;
         World world = pairWorlds.get(id);
-        if (world == null) return; // controller not yet assigned; fall back to cross-TP path
+        plugin.getLogger().info("[pair] PlayerSpawnLocationEvent for " + player.getName()
+            + " — pairWorld=" + (world != null ? world.getName() : "null")
+            + " pairWorlds.size=" + pairWorlds.size()
+            + " controllerOf.size=" + controllerOf.size());
+        if (world == null) {
+            plugin.getLogger().warning("[pair] camera " + player.getName()
+                + " spawning in default world — controller world unknown, cross-TP will follow");
+            return;
+        }
         UUID ctrlUuid = controllerOf.get(id);
         Player ctrl = (ctrlUuid != null) ? Bukkit.getPlayer(ctrlUuid) : null;
         Location spawnLoc = (ctrl != null && ctrl.isOnline())
@@ -97,7 +105,9 @@ public class MirrorPairManager implements Listener {
             : world.getSpawnLocation();
         event.setSpawnLocation(spawnLoc);
         plugin.getLogger().info("[pair] camera " + player.getName()
-            + " spawn intercepted → " + world.getName() + " (no Respawn packet)");
+            + " spawn intercepted → " + world.getName() + " @ "
+            + spawnLoc.getBlockX() + "," + spawnLoc.getBlockY() + "," + spawnLoc.getBlockZ()
+            + " (no Respawn packet)");
     }
 
     // ── Naming helpers ──────────────────────────────────────────────────────────

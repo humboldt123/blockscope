@@ -75,7 +75,39 @@ cleanup() {
 on_exit() { [ "$KEEP" = "1" ] || cleanup; }
 trap on_exit EXIT INT TERM
 
-# --- 1. stage + start camera container -------------------------------------------
+# --- 1. start controller first (so Lodestone assigns it a world before camera joins) ---
+# The camera uses PlayerSpawnLocationEvent to spawn directly in the controller's world
+# (no cross-world teleport → no Respawn packet → no ReplayMod thread-pool teardown).
+# That event reads pairWorlds, which is populated when the controller joins. So the
+# controller MUST join and be assigned a world BEFORE the camera connects.
+mkdir -p "$CTRL_DIR"
+cp -f "$COLLECTOR_ROOT/controller/controller.js" "$CTRL_DIR/controller.js"
+cp -f "$COLLECTOR_ROOT/controller/package.json" "$CTRL_DIR/package.json"
+if [ ! -d "$CTRL_DIR/node_modules" ]; then
+  if [ -d "$HOME/mirror_prototype/controller/node_modules" ]; then
+    cp -r "$HOME/mirror_prototype/controller/node_modules" "$CTRL_DIR/node_modules"
+  else
+    ( cd "$CTRL_DIR" && npm install --no-audit --no-fund )
+  fi
+fi
+echo "[run:$INSTANCE] starting controller '$CONTROLLER_USER' -> $MC_HOST:$MC_PORT (first, so world is ready for camera) ..."
+( cd "$CTRL_DIR" && node controller.js \
+    --host "$MC_HOST" --port "$MC_PORT" --user "$CONTROLLER_USER" \
+    --episode "$EPISODE" --duration "$DURATION" ${EXTRA_CTRL_ARGS:-} ) > "$CTRL_LOG" 2>&1 &
+CTRL_PID=$!
+echo "[run:$INSTANCE] waiting for controller '$CONTROLLER_USER' to spawn + get world assignment ..."
+CTRL_OK=0
+for i in $(seq 1 90); do
+  grep -qE '\[ctrl\] spawned at' "$CTRL_LOG" 2>/dev/null && { CTRL_OK=1; break; }
+  kill -0 "$CTRL_PID" 2>/dev/null || break
+  sleep 1
+done
+[ "$CTRL_OK" = "1" ] || { echo "[run:$INSTANCE] controller never spawned"; tail -20 "$CTRL_LOG"; exit 1; }
+echo "[run:$INSTANCE] controller spawned — Lodestone has assigned its world. Starting camera now ..."
+# Small pause for Lodestone to fully register the world in pairWorlds (one tick).
+sleep 2
+
+# --- 2. stage + start camera container -------------------------------------------
 # Build a baritone-FREE mods dir -> client treats session_start as record-only.
 mkdir -p "$CAM_DIR/mods"
 rm -f "$CAM_DIR/mods"/*.jar
@@ -123,36 +155,6 @@ done
 [ "$CAM_OK" = "1" ] || { echo "[run:$INSTANCE] camera never connected"; tail -40 "$CAM_LOG"; exit 1; }
 echo "[run:$INSTANCE] camera connected"
 
-# --- 2. start controller ---------------------------------------------------------
-mkdir -p "$CTRL_DIR"
-cp -f "$COLLECTOR_ROOT/controller/controller.js" "$CTRL_DIR/controller.js"
-cp -f "$COLLECTOR_ROOT/controller/package.json" "$CTRL_DIR/package.json"
-if [ ! -d "$CTRL_DIR/node_modules" ]; then
-  if [ -d "$HOME/mirror_prototype/controller/node_modules" ]; then
-    cp -r "$HOME/mirror_prototype/controller/node_modules" "$CTRL_DIR/node_modules"
-  else
-    ( cd "$CTRL_DIR" && npm install --no-audit --no-fund )
-  fi
-fi
-# Brief pause so the VPS connection-throttle window clears between camera + controller.
-# Default throttle is 4s — 10s gives a wide margin. Set connection-throttle=-1 on
-# the VPS to remove this entirely (needs server.properties edit + restart).
-sleep 10
-echo "[run:$INSTANCE] starting controller '$CONTROLLER_USER' -> $MC_HOST:$MC_PORT ..."
-( cd "$CTRL_DIR" && node controller.js \
-    --host "$MC_HOST" --port "$MC_PORT" --user "$CONTROLLER_USER" \
-    --episode "$EPISODE" --duration "$DURATION" ${EXTRA_CTRL_ARGS:-} ) > "$CTRL_LOG" 2>&1 &
-CTRL_PID=$!
-
-echo "[run:$INSTANCE] waiting for controller '$CONTROLLER_USER' to spawn ..."
-CTRL_OK=0
-for i in $(seq 1 90); do
-  grep -qE '\[ctrl\] spawned at' "$CTRL_LOG" 2>/dev/null && { CTRL_OK=1; break; }
-  # bail early if the controller process already died
-  kill -0 "$CTRL_PID" 2>/dev/null || break
-  sleep 1
-done
-[ "$CTRL_OK" = "1" ] || { echo "[run:$INSTANCE] controller never spawned"; tail -30 "$CTRL_LOG"; exit 1; }
 echo "[run:$INSTANCE] controller spawned. Lodestone is pairing + mirroring; driving episode for ${DURATION}s ..."
 
 # --- 3. wait for the episode (controller quits when done) ------------------------

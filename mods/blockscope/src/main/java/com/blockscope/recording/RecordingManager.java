@@ -194,29 +194,6 @@ public class RecordingManager {
         try {
             if (ReplayMod.instance == null) return false; // ReplayMod not initialized yet — retry next tick
 
-            // In headless mode the entrypoint already wiped replay_recordings before
-            // launch, so initialScan has nothing to scan and cannot race the live
-            // recording. Skip the Phase 1 park / Phase 2 switch entirely — each
-            // RECORDING_PATH change triggers ReplayMod to reinitialize its
-            // PacketListener and terminate the previous thread pool, so the two-phase
-            // redirect was the very thing killing recording after ~2s.
-            // Just set a single fresh per-boot dir once and never change it again.
-            boolean headless = "true".equals(System.getProperty("blockscope.headless"))
-                || "1".equals(System.getenv("BLOCKSCOPE_HEADLESS"));
-            if (headless) {
-                bootReplayPath = "./" + REPLAY_BASE_DIR + "/rec_" + Instant.now().getEpochSecond() + "/";
-                ReplayMod.instance.getSettingsRegistry().set(
-                    com.replaymod.core.Setting.RECORDING_PATH, bootReplayPath);
-                replayReady = true;
-                String abs = ReplayMod.instance.folders.getReplayFolder().toAbsolutePath().toString();
-                System.out.println("[Blockscope] Headless: RECORDING_PATH -> " + abs
-                    + " (no Phase 1/2 scan sequencing needed; entrypoint wiped replay_recordings).");
-                return true;
-            }
-
-            // Non-headless (interactive / Windows client): use the original Phase 1/2 mechanism
-            // to sequence around initialScan which may try to recover an orphaned .mcpr.tmp.
-
             // Phase 1: redirect to an empty scan dir so initialScan is a guaranteed no-op.
             if (!scanDirSet) {
                 String scanRel = "./" + REPLAY_BASE_DIR + "/scan_" + Instant.now().getEpochSecond() + "/";
@@ -240,13 +217,15 @@ public class RecordingManager {
                     + waited + "ms — proceeding (scan dir was empty, so a late scan is harmless).");
             }
 
-            bootReplayPath = "./" + REPLAY_BASE_DIR + "/rec_" + Instant.now().getEpochSecond() + "/";
-            ReplayMod.instance.getSettingsRegistry().set(
-                com.replaymod.core.Setting.RECORDING_PATH, bootReplayPath);
+            // IMPORTANT: do NOT set RECORDING_PATH a second time. Each set() call
+            // causes ReplayMod to reinitialize ReplayFilesService and terminate the
+            // PacketListener thread pool, killing recording after ~2s. The scan dir is
+            // already empty (initialScan was a no-op against it) — just USE it for
+            // recording as-is. No second set() = no thread-pool teardown.
             String abs = ReplayMod.instance.folders.getReplayFolder().toAbsolutePath().toString();
             replayReady = true;
-            System.out.println("[Blockscope] Phase 2: initialScan complete — RECORDING_PATH -> " + abs +
-                " (live recording is now isolated from the one-time recovery scan).");
+            System.out.println("[Blockscope] Phase 2: initialScan complete — using existing dir "
+                + abs + " (no second RECORDING_PATH set = no thread-pool teardown).");
             return true;
         } catch (Exception e) {
             System.err.println("[Blockscope] Could not sequence replay path: " + e.getMessage());
