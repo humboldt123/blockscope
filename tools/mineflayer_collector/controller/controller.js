@@ -137,10 +137,38 @@ async function lookAround360(bot, totalMs = 8000, pitchLo = -0.35, pitchHi = 0.7
   }
 }
 
+/**
+ * Slow continuous look-around for the camera-wait period. Rotates yaw a full 360°
+ * at ~degPerSec (default ~5°/s) while smoothly varying pitch between pitchLo and
+ * pitchHi, looping until totalMs elapses. Unlike a frozen stand-still, this gives
+ * the mirrored camera interesting moving views during the 90s startup wait.
+ */
+async function slowLookWander(bot, totalMs, degPerSec = 5, pitchLo = -0.349, pitchHi = 0.698) {
+  const start = Date.now();
+  const radPerSec = degPerSec * Math.PI / 180;
+  const stepMs = 200; // smooth update cadence
+  let yaw = bot.entity.yaw || 0;
+  // Pitch oscillates over a slow cycle so we sweep up/down a few times per full turn.
+  const pitchPeriodMs = 12000; // one full pitch up/down cycle every 12s
+  while (Date.now() - start < totalMs) {
+    const elapsed = Date.now() - start;
+    yaw += radPerSec * (stepMs / 1000);
+    if (yaw > Math.PI * 2) yaw -= Math.PI * 2;
+    const pitchFrac = (Math.sin((elapsed / pitchPeriodMs) * Math.PI * 2) + 1) / 2; // 0..1
+    const pitch = pitchLo + pitchFrac * (pitchHi - pitchLo);
+    await bot.look(yaw, pitch, false);
+    await sleep(stepMs);
+  }
+}
+
 // ------------------------------------------------ pathfinder helpers (tuned)
 function initPathfinder(bot, mcData) {
   const m = new Movements(bot, mcData);
-  m.allowSprinting = true;
+  // SPEED CAP: pathfinder enables sprinting by default (~5.6 m/s, looks "rly fast" on camera).
+  // mineflayer-pathfinder gates every setControlState('sprint', true) call behind
+  // Movements.allowSprinting (see node_modules/mineflayer-pathfinder/index.js), so flipping
+  // this to false keeps the bot at the ~4.3 m/s walk speed — much more watchable footage.
+  m.allowSprinting = false;
   m.allowParkour = true;
   m.canDig = false;       // never tear up the build map
   m.canPlaceOn = false;
@@ -854,12 +882,41 @@ function main() {
   bot.loadPlugin(pathfinder);
   bot.on("kicked", (r) => console.log("[ctrl] kicked:", r));
   bot.on("error", (e) => console.log("[ctrl] error:", e.message));
-  bot.on("end", (r) => { console.log("[ctrl] disconnected:", r); process.exit(0); });
+  bot.on("end", (r) => {
+    if (bot._posLogger) { clearInterval(bot._posLogger); bot._posLogger = null; }
+    console.log("[ctrl] disconnected:", r);
+    process.exit(0);
+  });
 
   bot.once("spawn", async () => {
     console.log(`[ctrl] spawned at ${fmt(bot.entity.position)}`);
     const mcData = require("minecraft-data")(bot.version);
     initPathfinder(bot, mcData);
+
+    // DEBUG: per-second position logger + stuck detection, running for the life of the
+    // process (cleared on 'end'). Logs position every second; if the bot hasn't moved
+    // >0.5 blocks in 3 consecutive seconds, logs a STUCK line so we can see exactly when
+    // and where the pathfinder stalls (e.g. while it's deciding). Does NOT disconnect —
+    // each episode's per-goal timeouts own recovery.
+    {
+      let prevPos = bot.entity.position.clone();
+      let stillSecs = 0;
+      bot._posLogger = setInterval(() => {
+        if (!bot.entity || !bot.entity.position) return;
+        const p = bot.entity.position;
+        const moved = p.distanceTo(prevPos);
+        console.log(`[ctrl] pos ${fmt(p)} (moved ${moved.toFixed(2)} last 1s)`);
+        if (moved <= 0.5) {
+          stillSecs++;
+          if (stillSecs >= 3) {
+            console.log(`[ctrl] STUCK at ${fmt(p)} — pathfinder may be deciding`);
+          }
+        } else {
+          stillSecs = 0;
+        }
+        prevPos = p.clone();
+      }, 1000);
+    }
     // Wait for the camera client to finish loading Fabric + assets + auto-connect.
     // A cold Docker container takes ~90s on first boot (warm = ~30s with cached assets).
     // Overridable via --wait-for-camera <seconds>. The camera logs 'Recording started'
@@ -867,7 +924,11 @@ function main() {
     const camWait = args.waitForCamera != null ? args.waitForCamera * 1000 : 90000;
     if (camWait > 0) {
       console.log(`[ctrl] waiting ${camWait/1000}s for camera to load + join (set --wait-for-camera 0 to skip) ...`);
-      await sleep(camWait);
+      // Don't stand frozen: the camera is already mirrored onto us, so a still bot means
+      // the viewer records ~90s of a frozen frame. Do slow ~5°/s look-arounds for the whole
+      // wait so the camera captures moving, interesting views while it boots.
+      try { await slowLookWander(bot, camWait, 5, -0.349, 0.698); }
+      catch (e) { console.log(`[ctrl] slowLookWander error (non-fatal): ${e.message}`); await sleep(camWait); }
     }
     try {
       switch (args.episode) {
