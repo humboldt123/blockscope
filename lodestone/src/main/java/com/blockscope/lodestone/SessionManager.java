@@ -861,8 +861,16 @@ public class SessionManager implements Listener {
     }
 
     /** Cobblestone for sky-island bridging (Baritone uses it as throwaway scaffolding). */
+    private static final Material[] BRIDGE_MATERIALS = {
+        Material.COBBLESTONE, Material.STONE, Material.DIRT,
+        Material.STONE_BRICKS, Material.OAK_PLANKS, Material.GLOWSTONE,
+        Material.WHITE_WOOL, Material.SNOW_BLOCK,
+    };
+    private final java.util.Random bridgeRng = new java.util.Random();
+
     private void giveBridgeBlocks(Player player) {
-        for (int i = 0; i < 5; i++) player.getInventory().addItem(new ItemStack(Material.COBBLESTONE, 64));
+        Material mat = BRIDGE_MATERIALS[bridgeRng.nextInt(BRIDGE_MATERIALS.length)];
+        for (int i = 0; i < 5; i++) player.getInventory().addItem(new ItemStack(mat, 64));
     }
 
     // Period-accurate (1.8-era) loot pool for SkyWars chest filling.
