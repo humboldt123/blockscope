@@ -353,12 +353,9 @@ async function interiorHuntEpisode(bot, mcData) {
   const CLUSTER_RADIUS = 8;
   const SCAN_DISTANCE = 64;
   function findNextCluster() {
-    const candidates = bot.findBlock({
-      matching: interiorIds,
-      maxDistance: SCAN_DISTANCE,
-      count: 32,
-    });
-    if (!candidates || candidates.length === 0) return null;
+    const positions = bot.findBlocks({ matching: interiorIds, maxDistance: SCAN_DISTANCE, count: 32 });
+    const candidates = positions.map(p => bot.blockAt(p)).filter(b => b !== null);
+    if (candidates.length === 0) return null;
 
     // Score each candidate: count how many other candidates are within CLUSTER_RADIUS.
     let bestBlock = null, bestScore = 0;
@@ -502,8 +499,9 @@ async function rareBlockEpisode(bot, mcData) {
 
   function pickBestUnvisited(ids) {
     if (ids.length === 0) return null;
-    const blocks = bot.findBlock({ matching: ids, maxDistance: SCAN_DIST, count: 16 });
-    if (!blocks || blocks.length === 0) return null;
+    const positions = bot.findBlocks({ matching: ids, maxDistance: SCAN_DIST, count: 16 });
+    const blocks = positions.map(p => bot.blockAt(p)).filter(b => b !== null);
+    if (blocks.length === 0) return null;
     // Return closest unvisited block.
     let best = null, bestDist = Infinity;
     const pos = bot.entity.position;
@@ -739,17 +737,12 @@ async function mineEpisode(bot, mcData) {
         console.log(`[ctrl:mine] mined ${block.name} @ ${fmt(block.position)} (${count}/${MAX_VEIN_BLOCKS})`);
         // Scan adjacent area for more ore of the same type.
         if (count < MAX_VEIN_BLOCKS) {
-          const adjacent = bot.findBlock({
-            matching: [block.type],
-            maxDistance: VEIN_ADJACENT_RANGE,
-            count: 4,
-            point: block.position,
-          });
-          if (adjacent) {
-            for (const adj of adjacent) {
-              const adjKey = `${adj.position.x},${adj.position.y},${adj.position.z}`;
-              if (!minedKeys.has(adjKey)) toMine.push(adj);
-            }
+          const adjPositions = bot.findBlocks({ matching: [block.type], maxDistance: VEIN_ADJACENT_RANGE, count: 4 });
+          for (const adjPos of adjPositions) {
+            const adjKey = `${adjPos.x},${adjPos.y},${adjPos.z}`;
+            if (minedKeys.has(adjKey)) continue;
+            const adjBlock = bot.blockAt(adjPos);
+            if (adjBlock) toMine.push(adjBlock);
           }
         }
       }
@@ -788,8 +781,9 @@ async function mineEpisode(bot, mcData) {
       continue;
     }
 
-    const ores = bot.findBlock({ matching: oreIds, maxDistance: ORE_SCAN_DIST, count: 8 });
-    if (!ores || ores.length === 0) {
+    const orePositions = bot.findBlocks({ matching: oreIds, maxDistance: ORE_SCAN_DIST, count: 8 });
+    const ores = orePositions.map(p => bot.blockAt(p)).filter(b => b !== null);
+    if (ores.length === 0) {
       // No ores visible — explore underground for 20s to find new chunks.
       console.log("[ctrl:mine] no ores in range; exploring underground");
       const p = bot.entity.position;
