@@ -3,10 +3,20 @@ tool_randomisation_enabled: true
 tool_check_interval_seconds: 30
 session_duration_seconds: 600
 
-# Which world categories to serve (round-robined across all enabled)
+# Which world categories to serve (weighted random selection)
 survival_worlds: false      # 1.19 generated terrain — leaks modern blocks even with datapack; off by default
 void_worlds: true           # void scatter — clean controlled 1.8.9-era palette
 library_worlds: true        # pre-built converted maps (build maps + hermitcraft) from map_library/, copy-on-join
+
+# Weighted random category selection (integer weights; 0 = disabled/excluded).
+# void maps to void_worlds; terrain/skywars/hypixel/hermitcraft map to library_worlds.
+# If a category has no available worlds its weight is skipped and others are renormalized.
+world_weights:
+  void: 50
+  terrain: 40
+  skywars: 7
+  hypixel: 3
+  hermitcraft: 0
 
 # SOURCE library maps served in ADVENTURE gamemode (bot can't break — preserves the
 # most valuable maps). Every other library map runs in SURVIVAL (bot can break obstacles).
@@ -27,5 +37,5 @@ world_type: modern
 # classic_152 = only blocks that existed in MC 1.5.2 (old-block-only data); avoid all_1_19 (modern blocks).
 void_scatter_palette: classic_152
 
-# Pre-staged copies per category (VPS is 8 vCPU/16GB; library copies can be ~1.3GB each)
-pool_size: 2
+# Pre-staged copies per category (VPS upgraded to 8 vCPU/16 GB; library copies ~61 MB–1.3 GB each)
+pool_size: 6

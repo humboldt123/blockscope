@@ -52,6 +52,24 @@ public class SessionManager implements Listener {
     enum WorldType { MODERN, BETA, LEGACY_2013 }
     private final WorldType worldType;
 
+    // ── World categories ────────────────────────────────────────────────────────
+    enum WorldCategory { VOID, TERRAIN, SKYWARS, HYPIXEL, HERMITCRAFT }
+
+    /** Classify a library source world name into a category. */
+    private static WorldCategory classifySource(String name) {
+        if (name == null) return WorldCategory.TERRAIN;
+        String lower = name.toLowerCase();
+        if (lower.startsWith("hermitcraft"))    return WorldCategory.HERMITCRAFT;
+        if (lower.startsWith("skywars") || lower.startsWith("bedwars")) return WorldCategory.SKYWARS;
+        if (lower.startsWith("hypixel"))        return WorldCategory.HYPIXEL;
+        if (lower.startsWith("generated_1_8_")) return WorldCategory.TERRAIN;
+        // Unknown library sources default to terrain (safe category with non-zero weight)
+        return WorldCategory.TERRAIN;
+    }
+
+    /** Weights per category, loaded from config (world_weights section). */
+    private final java.util.Map<WorldCategory, Integer> categoryWeights = new java.util.EnumMap<>(WorldCategory.class);
+
     // Library worlds: pre-built converted maps (build maps + hermitcraft) under
     // map_library/. Served copy-on-join in ADVENTURE mode so the bot walks the
     // build without modifying it, and each session gets a throwaway copy that is
@@ -73,7 +91,8 @@ public class SessionManager implements Listener {
 
     private final Queue<World> survivalPool = new ConcurrentLinkedQueue<>();
     private final Queue<World> voidPool     = new ConcurrentLinkedQueue<>();
-    private final Queue<World> libraryPool  = new ConcurrentLinkedQueue<>();
+    // Per-category library pools (terrain, skywars, hypixel, hermitcraft).
+    private final java.util.Map<WorldCategory, Queue<World>> libraryPools = new java.util.EnumMap<>(WorldCategory.class);
     private final Map<UUID, World> playerWorlds = new ConcurrentHashMap<>();
     // Paired-camera UUIDs: registered in playerWorlds (so damage/respawn guards + teleport
     // back work) but they SHARE the controller's world, so their endSession must NOT delete
@@ -89,8 +108,6 @@ public class SessionManager implements Listener {
         t.setDaemon(true);
         return t;
     });
-
-    private int modeIndex = 0;
 
     // Paired (controller, camera) sessions — purely additive (see MirrorPairManager).
     private MirrorPairManager pairManager;
@@ -126,6 +143,18 @@ public class SessionManager implements Listener {
             default            -> WorldType.MODERN;
         };
 
+        // Load world_weights from config (defaults: void=50 terrain=40 skywars=7 hypixel=3 hermitcraft=0)
+        org.bukkit.configuration.ConfigurationSection ww = cfg.getConfigurationSection("world_weights");
+        categoryWeights.put(WorldCategory.VOID,       ww != null ? ww.getInt("void",       50) : 50);
+        categoryWeights.put(WorldCategory.TERRAIN,    ww != null ? ww.getInt("terrain",    40) : 40);
+        categoryWeights.put(WorldCategory.SKYWARS,    ww != null ? ww.getInt("skywars",     7) :  7);
+        categoryWeights.put(WorldCategory.HYPIXEL,    ww != null ? ww.getInt("hypixel",     3) :  3);
+        categoryWeights.put(WorldCategory.HERMITCRAFT, ww != null ? ww.getInt("hermitcraft", 0) :  0);
+
+        // Initialise per-category library pool queues
+        for (WorldCategory cat : WorldCategory.values()) {
+            if (cat != WorldCategory.VOID) libraryPools.put(cat, new ConcurrentLinkedQueue<>());
+        }
     }
 
     /** Wired up in LodestonePlugin.onEnable so the paired path can drive teardown. */
@@ -336,13 +365,27 @@ public class SessionManager implements Listener {
                 }
             }
             if (libraryEnabled && !librarySources.isEmpty()) {
-                while (libraryPool.size() < poolSize) {
-                    World w = copyLibraryWorld();
-                    if (w != null) {
-                        libraryPool.add(w);
-                        plugin.getLogger().info("World pool: library world ready (" + w.getName() + "), pool size=" + libraryPool.size());
-                    } else {
-                        break; // copy failed — avoid a tight retry loop
+                // Refill each library category that has a non-zero weight and source worlds.
+                for (java.util.Map.Entry<WorldCategory, Queue<World>> entry : libraryPools.entrySet()) {
+                    WorldCategory cat = entry.getKey();
+                    Queue<World> pool = entry.getValue();
+                    int weight = categoryWeights.getOrDefault(cat, 0);
+                    if (weight == 0) continue; // excluded category — skip entirely
+                    // Find sources that belong to this category.
+                    java.util.List<File> catSources = new java.util.ArrayList<>();
+                    for (File src : librarySources) {
+                        if (classifySource(src.getName()) == cat) catSources.add(src);
+                    }
+                    if (catSources.isEmpty()) continue;
+                    while (pool.size() < poolSize) {
+                        File src = catSources.get(rng.nextInt(catSources.size()));
+                        World w = copyLibraryWorld(src);
+                        if (w != null) {
+                            pool.add(w);
+                            plugin.getLogger().info("World pool: library[" + cat + "] world ready (" + w.getName() + " from " + src.getName() + "), pool size=" + pool.size());
+                        } else {
+                            break; // copy failed — avoid a tight retry loop
+                        }
                     }
                 }
             }
@@ -350,18 +393,11 @@ public class SessionManager implements Listener {
     }
 
     /**
-     * Copy a random source world from map_library/ into a fresh bs_lib_* world dir,
+     * Copy a specific source world from map_library/ into a fresh bs_lib_* world dir,
      * load it with a void generator (out-of-bounds chunks → void, never new terrain),
      * and remember its spawn candidates. Runs on the bgPool thread; the createWorld
      * call is dispatched to the main thread. Returns the loaded copy, or null on error.
-     */
-    private World copyLibraryWorld() {
-        return copyLibraryWorld(librarySources.get(rng.nextInt(librarySources.size())));
-    }
-
-    /**
-     * Copy a SPECIFIC source world from map_library/ into a fresh bs_lib_* world dir.
-     * Same logic as the random variant but for a caller-chosen source (used by /visit).
+     * Used both by refillPool (with a category-filtered source) and /visit (op-chosen source).
      */
     private World copyLibraryWorld(File source) {
         String name = "bs_lib_" + worldCounter.incrementAndGet() + "_" + Long.toHexString(rng.nextLong() & 0xFFFFFFL);
@@ -591,16 +627,37 @@ public class SessionManager implements Listener {
             return;
         }
 
-        String category = assignMode(); // "void" | "survival" | "library"
+        WorldCategory chosenCat = assignCategory(); // weighted random
+
+        // Map WorldCategory → legacy string used throughout the rest of onPlayerJoin.
+        // VOID → "void", TERRAIN/SKYWARS/HYPIXEL/HERMITCRAFT → "library", anything else → "survival"
+        String category = switch (chosenCat) {
+            case VOID -> "void";
+            case TERRAIN, SKYWARS, HYPIXEL, HERMITCRAFT -> "library";
+            default -> "survival";
+        };
 
         // Resolve a world for the chosen category. Library worlds come only from the
         // pre-staged pool (the copy is too large to do synchronously at join); if the
         // library pool is momentarily empty, fall back to a fast-to-generate void world.
         World world;
         if ("library".equals(category)) {
-            world = libraryPool.poll();
+            Queue<World> catPool = libraryPools.get(chosenCat);
+            world = (catPool != null) ? catPool.poll() : null;
             if (world == null) {
-                plugin.getLogger().warning("Library pool empty — falling back to void for " + player.getName());
+                // Try any other non-empty library pool before falling back to void.
+                for (java.util.Map.Entry<WorldCategory, Queue<World>> e : libraryPools.entrySet()) {
+                    if (e.getKey() == chosenCat) continue;
+                    if (categoryWeights.getOrDefault(e.getKey(), 0) == 0) continue;
+                    world = e.getValue().poll();
+                    if (world != null) {
+                        plugin.getLogger().warning("Library pool[" + chosenCat + "] empty — used pool[" + e.getKey() + "] for " + player.getName());
+                        break;
+                    }
+                }
+            }
+            if (world == null) {
+                plugin.getLogger().warning("All library pools empty — falling back to void for " + player.getName());
                 category = "void";
                 world = voidPool.poll();
                 if (world == null) world = generateVoidWorldSync();
@@ -843,6 +900,52 @@ public class SessionManager implements Listener {
         return live.size();
     }
 
+    /**
+     * Pick a WorldCategory by weighted random.
+     *
+     * Candidates are filtered to categories that are actually available:
+     *   - VOID: only if void_worlds is enabled
+     *   - library categories (TERRAIN/SKYWARS/HYPIXEL/HERMITCRAFT): only if library_worlds
+     *     is enabled AND there is at least one source world of that category
+     *   - weight 0 → always excluded
+     *
+     * Falls back to VOID if nothing qualifies.
+     */
+    private WorldCategory assignCategory() {
+        java.util.List<WorldCategory> candidates = new java.util.ArrayList<>();
+        java.util.List<Integer> weights = new java.util.ArrayList<>();
+
+        for (WorldCategory cat : WorldCategory.values()) {
+            int w = categoryWeights.getOrDefault(cat, 0);
+            if (w <= 0) continue;
+            if (cat == WorldCategory.VOID) {
+                if (!voidEnabled) continue;
+            } else {
+                // Library category: needs library_worlds enabled AND at least one source.
+                if (!libraryEnabled) continue;
+                boolean hasSource = false;
+                for (File src : librarySources) {
+                    if (classifySource(src.getName()) == cat) { hasSource = true; break; }
+                }
+                if (!hasSource) continue;
+            }
+            candidates.add(cat);
+            weights.add(w);
+        }
+
+        if (candidates.isEmpty()) return WorldCategory.VOID; // safe fallback
+
+        int total = 0;
+        for (int w : weights) total += w;
+        int roll = rng.nextInt(total);
+        int cumulative = 0;
+        for (int i = 0; i < candidates.size(); i++) {
+            cumulative += weights.get(i);
+            if (roll < cumulative) return candidates.get(i);
+        }
+        return candidates.get(candidates.size() - 1); // shouldn't reach here
+    }
+
     /** Map an internal world category to the client-side BotModule mode string. */
     private String clientModeFor(String category) {
         return switch (category) {
@@ -1043,16 +1146,7 @@ public class SessionManager implements Listener {
         player.sendPluginMessage(plugin, SESSION_CHANNEL, buf.array());
     }
 
-    // ── Helpers ────────────────────────────────────────────────────────────────
-
-    private String assignMode() {
-        java.util.List<String> modes = new java.util.ArrayList<>();
-        if (survivalEnabled) modes.add("survival");
-        if (voidEnabled)     modes.add("void");
-        if (libraryEnabled && !librarySources.isEmpty()) modes.add("library");
-        if (modes.isEmpty()) return "void";
-        return modes.get((modeIndex++) % modes.size());
-    }
+    // ── World generation helpers ─────────────────────────────────────────────────
 
     /** Called from bgPool thread — dispatches createWorld() to main thread then waits. */
     private World generateVoidWorldFromBg() {
@@ -1206,9 +1300,11 @@ public class SessionManager implements Listener {
         bgPool.shutdownNow();
         for (World w : survivalPool) unloadAndDeleteWorld(w);
         for (World w : voidPool)     unloadAndDeleteWorld(w);
-        for (World w : libraryPool)  unloadAndDeleteWorld(w);
+        for (Queue<World> pool : libraryPools.values()) {
+            for (World w : pool) unloadAndDeleteWorld(w);
+            pool.clear();
+        }
         survivalPool.clear();
         voidPool.clear();
-        libraryPool.clear();
     }
 }
